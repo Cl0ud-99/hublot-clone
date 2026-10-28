@@ -96,10 +96,17 @@ export type CabinObjects = {
   windowLight: THREE.PointLight;
   /** 半球光：天空在上 / 地面在下，给机翼提供方向性环境照明 */
   skyLight: THREE.HemisphereLight;
-  /** 机翼材质（main.ts 按昼夜调 envMapIntensity） */
-  wingMaterial: THREE.MeshStandardMaterial;
-  /** 短舱材质（同上） */
-  nacelleMaterial: THREE.MeshStandardMaterial;
+  /**
+   * 所有「受窗外光照影响」的材质。
+   *
+   * ── 为什么做成数组 ──
+   * 机翼 / 短舱 / 翼梢小翼 / 后缘棱线 都需要在 main.ts 里按
+   * cabinScale 和 dayness 调 envMapIntensity。之前是一个个字段加，
+   * 结果新加的翼梢小翼和棱线漏掉了 —— 暮光下它们保持满亮度，
+   * 被 bloom 放大成一颗粉色光球。这个坑已经踩了三次，改成数组，
+   * 以后新增材质只要 push 进来就不会再漏。
+   */
+  exposureMaterials: THREE.MeshStandardMaterial[];
   dispose(): void;
 };
 
@@ -646,6 +653,9 @@ export function createCabin(maxAnisotropy = 4): CabinObjects {
   });
   disposables.push(wingMat);
 
+  /** 需要按曝光缩放的材质（见 CabinObjects.exposureMaterials 的说明） */
+  const exposureMats: THREE.MeshStandardMaterial[] = [wingMat];
+
   const wingMesh = new THREE.Mesh(wingGeo, wingMat);
   wing.add(wingMesh);
 
@@ -774,14 +784,93 @@ export function createCabin(maxAnisotropy = 4): CabinObjects {
   })();
   disposables.push(wingletGeo);
 
-  const winglet = new THREE.Mesh(wingletGeo, wingMat);
+  /**
+   * 翼梢小翼：红色涂装。
+   *
+   * 原站截图里翼梢小翼是**暗红色**的，被低角度阳光照得发亮 ——
+   * 这是整个窗口里最抓眼的一块颜色，也是「像真飞机」的关键符号
+   * （很多航司的翼梢小翼确实刷成品牌色）。
+   *
+   * 之前用机翼的灰色材质，看起来只是一个黑色小方块，完全认不出是小翼。
+   */
+  const wingletMat = new THREE.MeshStandardMaterial({
+    color: 0x8f1a1e,
+    roughness: 0.42,
+    metalness: 0.05,
+    envMap: skyEnv,
+    envMapIntensity: 1.0,
+    side: THREE.DoubleSide,
+  });
+  disposables.push(wingletMat);
+  exposureMats.push(wingletMat);
+
+  const winglet = new THREE.Mesh(wingletGeo, wingletMat);
   const tipX = WING_SPAN;
   const tipY = Math.tan(DIHEDRAL) * tipX;
   // 小翼的本地 +X 是展向（向上翘之前），所以放在翼尖后绕 Z 轴上翘
   winglet.position.set(tipX, tipY, Math.tan(SWEEP) * tipX);
-  // 60° 上翘，接近 737 NG 的融合式小翼
-  winglet.rotation.z = (60 * Math.PI) / 180;
+  // 70° 上翘：原站截图里小翼几乎是立起来的，60° 太趴
+  winglet.rotation.z = (70 * Math.PI) / 180;
   wing.add(winglet);
+
+  /**
+   * ── 后缘棱线（原站最标志性的细节）──
+   *
+   * 真实机翼的后缘是一条**锐利的棱**：上下表面在这里收拢成一条线。
+   * 从舷窗看过去（视线几乎平行于翼面），这条棱会掠射反射天空，
+   * 形成一条贯穿全长的**极细白线** —— 周围全是黑的剪影，
+   * 只有这条线是亮的，对比极强。
+   *
+   * 为什么用独立几何而不是靠光照算出来：
+   * `computeVertexNormals` 会把后缘上下表面的法线**平均**掉，
+   * 变成圆滑过渡，掠射高光直接消失。用一条独立的细管最稳，
+   * 半径可以精确控制到「2~3 个屏幕像素」。
+   */
+  {
+    const pts: THREE.Vector3[] = [];
+    const SEG = 20;
+    for (let i = 0; i <= SEG; i++) {
+      const t = i / SEG;
+      const x = t * WING_SPAN;
+      const y = Math.tan(DIHEDRAL) * x;
+      // 后缘：弦向 u=1，翼型厚度 yt=0，所以 y 只受扭转影响
+      const chord = WING_CHORD_ROOT * (1 - (1 - TAPER_RATIO) * t);
+      const twist = WASHOUT * t;
+      const cz = chord;
+      const ry = -cz * Math.sin(twist);
+      const rz = cz * Math.cos(twist);
+      pts.push(new THREE.Vector3(x, y + ry, Math.tan(SWEEP) * x + rz));
+    }
+    const curve = new THREE.CatmullRomCurve3(pts);
+    const trailGeo = new THREE.TubeGeometry(curve, 96, 0.0055, 5, false);
+    disposables.push(trailGeo);
+
+    /**
+     * 材质：明亮的暖白 + 低粗糙度。
+     * 用 MeshStandardMaterial 而不是 Basic —— 这样它在暗处会跟着变暗，
+     * 不会出现「半夜机翼上挂着一条常亮的白线」。
+     */
+    /*
+     * ── 别给它自发光 ──
+     * 第一版用了 emissive 0x223344 * 0.35 + envMapIntensity 1.4，
+     * 结果暮光下这条线变成一颗巨大的光球（还被 bloom 放大）。
+     * 后缘亮线的本质是**镜面高光**，不是自发光 —— 环境亮它才亮。
+     * 所以只保留低粗糙度 + 中性色，让它跟着环境走。
+     */
+    const trailMat = new THREE.MeshStandardMaterial({
+      color: 0xc8d0d8,
+      roughness: 0.22,
+      metalness: 0.1,
+      envMap: skyEnv,
+      envMapIntensity: 1.0,
+      side: THREE.DoubleSide,
+    });
+    disposables.push(trailMat);
+    exposureMats.push(trailMat);
+    const trail = new THREE.Mesh(trailGeo, trailMat);
+    trail.name = 'wingTrail';
+    wing.add(trail);
+  }
 
   // =========================================================================
   // 2b. 发动机短舱
@@ -859,6 +948,7 @@ export function createCabin(maxAnisotropy = 4): CabinObjects {
     side: THREE.DoubleSide,
   });
   disposables.push(nacelleMat);
+  exposureMats.push(nacelleMat);
 
   const nacelle = new THREE.Mesh(nacelleGeo, nacelleMat);
   // 挂在机翼下方约 1/4 翼展处（真实布局：内侧发动机）
@@ -1016,9 +1106,9 @@ export function createCabin(maxAnisotropy = 4): CabinObjects {
   // 本轮：保持翼根位置，把缩放从 0.55 提到 0.85 让机翼铺开，
   // 同时略微下移，让翼面落在窗洞下半而不是贴着地平线。
   wing.position.set(
-    -3.75, // 横向：翼根伸出窗洞左边界（由 NDC 校准）
-    -0.75, // 垂直：下移，翼面在窗洞下半
-    -3.2, // 纵深
+    -3.95, // 横向：翼根伸出窗洞左边界（放大后同步外移）
+    -0.95, // 垂直：下移，翼面在窗洞下半
+    -3.1, // 纵深
   );
   /**
    * 整体缩放。
@@ -1027,7 +1117,7 @@ export function createCabin(maxAnisotropy = 4): CabinObjects {
    * 0.55 时翼尖只到 NDC x=0.04（机翼缩在左边一小块），
    * 提到 0.85 才能铺开到窗洞右缘。
    */
-  wing.scale.setScalar(0.85);
+  wing.scale.setScalar(1.18);
   root.add(wing);
 
   // =========================================================================
@@ -1095,8 +1185,7 @@ export function createCabin(maxAnisotropy = 4): CabinObjects {
     rimLight,
     windowLight,
     skyLight,
-    wingMaterial: wingMat,
-    nacelleMaterial: nacelleMat,
+    exposureMaterials: exposureMats,
     dispose() {
       wallGeo.dispose();
       wallMat.dispose();
