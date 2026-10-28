@@ -406,108 +406,96 @@ float populationAt(vec3 dir, float blur) {
 vec3 cityLights(vec3 groundPoint, vec3 normal, float tGround, float detail) {
   if (uCities <= 0.0) return vec3(0.0);
 
-  // 像素在地面上的足迹（km）。
-  //
-  // 用几何方式估算：远处一个像素跨越很大面积，
-  // 而且掠射时（视线几乎平行地表）还要再放大 1/cos(入射角)。
+  // 像素在地面上的足迹（km）。掠射时再放大 1/cos(入射角)。
   float cosIncidence = max(dot(normal, -normalize(groundPoint - uCamPos)), 0.02);
-  float footprintKm = (tGround * uPixelAngle) / cosIncidence;
-  footprintKm = clamp(footprintKm, 0.001, 4000.0);
+  float footprintKm = clamp((tGround * uPixelAngle) / cosIncidence, 0.0008, 4000.0);
 
-  // 人口密度（引导场）。
-  // 模糊半径按足迹给：远处多模糊，近处不模糊。
-  // 模糊量换算成 uv 单位（纹理横向覆盖 44° 经度）。
+  // 人口密度（引导场）：只用来决定「哪里有人」，不用来当亮度。
+  // 注意阈值比早期高得多：法国的人口底图几乎处处非零，
+  // 阈值太低会让每一寸土地都亮起来 —— 真实夜景是「黑大陆 + 少数光点」。
   float blurUv = clamp(footprintKm * 0.0009, 0.0, 0.03);
   float pop = populationAt(normal, blurUv);
-  if (pop < 0.015) return vec3(0.0);
+  if (pop < 0.02) return vec3(0.0);
 
-  // 地面公里坐标（含飞行位移）。
-  // 城市灯光必须跟着位移，否则地面在动、灯光却钉死在原地。
   vec2 pKm = vec2(
     atan(groundPoint.z, groundPoint.x),
     asin(clamp(groundPoint.y / uEarthRadius, -1.0, 1.0))
   ) * uEarthRadius + uFlightOffset;
 
   // 域扭曲：把规整晶格打散成有机形状
-  vec2 warp = (vec2(fbmTex(pKm * 0.06, 2), fbmTex(pKm * 0.06 + vec2(4.7, 1.3), 2)) - 0.5) * 3.5;
+  vec2 warp = (vec2(fbmTex(pKm * 0.05, 2), fbmTex(pKm * 0.05 + vec2(4.7, 1.3), 2)) - 0.5) * 2.4;
   vec2 pw = pKm + warp;
 
+  // ── 建成区场 ──
+  // 人口 × 噪声，得到不规则的城镇轮廓：核心（密而亮）、郊区（稀疏）、荒野（全黑）
+  float built = fbmTex(pw * 0.075 + 1.9, 3) * 0.50 + pop * 0.85;
+  float core = smoothstep(0.42, 0.68, built);
+  float outer = smoothstep(0.18, 0.45, built);
+  if (core + outer < 0.02) return vec3(0.0);
+
   vec3 col = vec3(0.0);
-  vec3 lampCol = vec3(1.0, 0.74, 0.42);
-  vec3 warmCol = vec3(1.0, 0.58, 0.26);
 
-  // --- 宏观层：都市圈辉光 ---
-  // 用 smoothstep 而不是 pop²，否则「有人的地方」会整片发亮。
-  // 真实高空夜景是「黑色大地 + 稀疏亮点」，只有真正的大城市才有光晕。
-  float cityMask = smoothstep(0.18, 0.62, pop);
-  // 宏观辉光权重原来给到 0.40，在自动曝光的暮光档位下会在地面铺成一片
-  // 连贯的橙色地毯（因为法国人口密度底图几乎处处非零）。
-  // 真实高空夜景是「黑地面 + 稀疏亮点」，所以压到 0.18。
-  col += vec3(1.0, 0.68, 0.38) * cityMask * 0.30;
+  /*
+   * ── 灯点：单层细晶格 ──
+   *
+   * 旧实现用了三个尺度（6 / 1.5 / 0.4 km），而且把光源有效尺寸写成
+   *   srcSize = max(S*0.32, footprintKm * 0.7)
+   * 这是「金色斑块」的直接原因：在 80~300 km 外，footprint 有 1~5 km，
+   * 于是每一盏灯都被撑到 2~4 km 宽，整格都亮，相邻格子连成一片。
+   * 能量守恒补回来的亮度又让这片区域整体发橙 —— 看起来像熔岩。
+   *
+   * 现在：格距固定 0.5 km（≈ 一个街区），光源物理尺寸 0.06~0.12 km
+   * （一盏路灯 / 一栋楼），只有「像素足迹」超过物理尺寸时才靠能量守恒退化。
+   * 远处一个像素覆盖多个街区 → 自然平均成一小片微光，而不是一个大亮斑。
+   */
+  const float S = 0.5;
+  vec2 cell = floor(pw / S);
+  vec2 f = fract(pw / S);
+  float h1 = hash21(cell);
+  float h2 = hash21(cell + 9.17);
 
-  // --- 微观层：三个尺度的灯点叠加 ---
-  // 尺度单位 km：都市圈 6、城区 1.5、街区 0.4
-  const float S1 = 6.0;
-  const float S2 = 1.5;
-  const float S3 = 0.4;
+  // 点亮概率：核心区约 55%，郊区约 8%
+  float pLit = mix(0.42, 0.92, core) * outer;
+  float lit = step(1.0 - pLit, h1);
 
-  // ── 能量守恒的关键 ──
-  // 一盏灯的物理尺寸远小于像素时，高斯峰值会随光源尺寸缩小而「消失」
-  // （总能量被摊薄到亚像素尺度上）。正确做法是把结果乘以
-  // (光源尺寸 / 像素足迹)² 的补偿因子，让「积分后的亮度」保持不变 ——
-  // 这样远处的一团灯会退化成一个小亮斑，而不是消失。
-  //
-  // 同时用 smoothstep 在「足迹远大于光源」时把该层逐渐淡出，
-  // 避免超过像素尺度后产生摩尔纹。
+  vec2 lp = 0.30 + 0.40 * hash22(cell + 3.71);
+  vec2 d = (f - lp) * S;               // km，到灯心的距离
 
-  // 第 1 层：都市圈（6 km）
-  if (footprintKm < S1 * 1.8) {
-    vec2 cell = floor(pw / S1);
-    vec2 f = fract(pw / S1);
-    float h = hash21(cell + 3.1);
-    float lit = step(0.30, h) * smoothstep(0.06, 0.30, pop);
-    vec2 lp = 0.2 + 0.6 * hash22(cell + 11.3);
-    vec2 d = (f - lp) * S1;
-    float srcSize = max(S1 * 0.32, footprintKm * 0.7);
-    float glow = exp(-dot(d, d) / (srcSize * srcSize));
-    float fade = 1.0 - smoothstep(S1 * 0.5, S1 * 1.8, footprintKm);
-    // 能量补偿：光源被 mip 平均掉的部分补回来
-    float energy = clamp((S1 * 0.32 * S1 * 0.32) / (srcSize * srcSize), 0.0, 1.0);
-    col += mix(lampCol, warmCol, h) * lit * glow * fade * energy * 1.4;
-  }
+  float srcKm = 0.060 + 0.060 * h2;    // 物理尺寸 60~120 m
+  // 屏幕有效尺寸：不小于 0.6 像素，否则亚像素光源会闪烁
+  float srcEff = max(srcKm, footprintKm * 0.6);
+  float glow = exp(-dot(d, d) / (srcEff * srcEff));
+  float energy = (srcKm * srcKm) / (srcEff * srcEff);
 
-  // 第 2 层：城区（1.5 km）
-  if (footprintKm < S2 * 1.8) {
-    vec2 cell = floor(pw / S2);
-    vec2 f = fract(pw / S2);
-    float h = hash21(cell + 17.7);
-    float lit = step(0.62, h) * smoothstep(0.05, 0.25, pop);
-    vec2 lp = 0.2 + 0.6 * hash22(cell + 23.9);
-    vec2 d = (f - lp) * S2;
-    float srcSize = max(S2 * 0.30, footprintKm * 0.7);
-    float glow = exp(-dot(d, d) / (srcSize * srcSize));
-    float fade = 1.0 - smoothstep(S2 * 0.5, S2 * 1.8, footprintKm);
-    float energy = clamp((S2 * 0.30 * S2 * 0.30) / (srcSize * srcSize), 0.0, 1.0);
-    col += mix(lampCol, warmCol, h) * lit * glow * fade * energy * 2.2;
-  }
-  // 第 3 层：街区 / 路灯（0.4 km）
-  if (footprintKm < S3 * 1.8) {
-    vec2 cell = floor(pw / S3);
-    vec2 f = fract(pw / S3);
-    float h = hash21(cell + 41.3);
-    float lit = step(0.80, h) * smoothstep(0.04, 0.20, pop);
-    vec2 lp = 0.25 + 0.5 * hash22(cell + 53.1);
-    vec2 d = (f - lp) * S3;
-    float srcSize = max(S3 * 0.26, footprintKm * 0.7);
-    float glow = exp(-dot(d, d) / (srcSize * srcSize));
-    float fade = 1.0 - smoothstep(S3 * 0.5, S3 * 1.8, footprintKm);
-    float energy = clamp((S3 * 0.26 * S3 * 0.26) / (srcSize * srcSize), 0.0, 1.0);
-    col += warmCol * lit * glow * fade * energy * 3.0;
-  }
+  // 亮度随机 + 核心区更亮
+  float bright = (0.5 + 1.5 * h2 * h2) * mix(0.6, 1.6, core);
+  vec3 sodium = vec3(1.0, 0.76, 0.46);   // 钠灯：暖橙
+  vec3 ledCol = vec3(1.0, 0.93, 0.82);   // LED：暖白
+  vec3 lampCol = mix(sodium, ledCol, step(0.62, h2));
 
-  // 远处被大气吸收（雾会遮挡灯光）
-  float haze = 1.0 - smoothstep(30.0, 320.0, tGround);
-  col *= mix(0.15, 1.0, haze);
+  col += lampCol * lit * glow * energy * bright * 14.0;
+
+  /*
+   * ── 街道 / 高速路：线状光 ──
+   * 真实夜景里最抓眼的其实是「线」：主干道、沿海城市带、河谷。
+   * 用晶格边界的软线 + 噪声打断，避免规则网格感。
+   */
+  vec2 g = fract(pw / (S * 4.0));
+  vec2 dg = min(g, 1.0 - g) * S * 4.0;
+  float lineD = min(dg.x, dg.y);
+  float lw = max(0.045, footprintKm * 0.5);
+  float lineN = fbmTex(pw * 0.18 + 7.7, 2);
+  float street = exp(-lineD * lineD / (lw * lw))
+               * smoothstep(0.40, 0.60, lineN)
+               * outer;
+  col += vec3(1.0, 0.68, 0.36) * street * 0.30;
+
+  // ── 城市光晕：只给核心区一点点，绝不铺满 ──
+  col += vec3(1.0, 0.62, 0.32) * core * 0.10;
+
+  // 远处被大气吸收（放宽到 500 km，地平线附近仍能看到城市带）
+  float haze = 1.0 - smoothstep(60.0, 500.0, tGround);
+  col *= mix(0.30, 1.0, haze);
 
   return col * uCities;
 }
