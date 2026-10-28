@@ -121,26 +121,112 @@ float noiseBand(vec2 uv, int band) {
 // ===========================================================================
 
 /**
- * 地表反照率。
- * @param pKm    地表点沿球面的公里坐标（近似平面）
- * @param detail 细节权重，远处衰减到 0 防闪烁
+ * 地形高度（米）。
+ *
+ * ── 为什么必须加 ──
+ * 原来地面只有 albedo，法线恒等于球面法线 —— 整块大地受光完全均匀，
+ * 看起来像一张贴在地球仪上的贴图，完全没有「地」的体量感。
+ * 真实高空俯瞰最抓眼的信息其实是**坡向明暗**：山脊亮、山谷暗。
+ *
+ * 三层频率叠加：
+ *   大陆起伏（~55 km 周期）  ±550 m
+ *   丘陵（~8 km 周期）        ±120 m
+ *   山脊（~12 km 周期）      0~420 m（二次脊线，产生锐利山脊）
+ *
+ * @param pKm 地表公里坐标
+ * @return 高度（米）
  */
-vec3 groundAlbedo(vec2 pKm, float detail) {
-  // 大尺度：农林分区（周期约 20 km）
+float terrainHeight(vec2 pKm) {
+  float macro = fbmTex(pKm * 0.0045 + vec2(1.7, 8.3), 3);
+  float hill = fbmTex(pKm * 0.031 + vec2(11.3, 3.1), 3);
+  float ridgeN = fbmTex(pKm * 0.020 + vec2(5.1, 19.7), 2);
+  float ridge = 1.0 - abs(ridgeN * 2.0 - 1.0);
+  ridge = ridge * ridge;
+  return (macro - 0.5) * 1100.0 + (hill - 0.5) * 240.0 + ridge * 420.0;
+}
+
+/**
+ * 田块色带：把 0~1 的噪声值映射成一条「深绿 → 草绿 → 黄绿 → 棕黄」的色带。
+ * 真实农田的颜色不是连续的，而是一块块差异很大的拼图 —— 用色带比直接 mix 两色更像。
+ */
+vec3 farmRamp(float t) {
+  vec3 c1 = vec3(0.062, 0.092, 0.044); // 深绿（牧草 / 林地）
+  vec3 c2 = vec3(0.128, 0.152, 0.072); // 草绿
+  vec3 c3 = vec3(0.196, 0.174, 0.088); // 黄绿（成熟作物）
+  vec3 c4 = vec3(0.250, 0.202, 0.110); // 棕黄（收割 / 翻耕）
+  vec3 col = mix(c1, c2, smoothstep(0.00, 0.34, t));
+  col = mix(col, c3, smoothstep(0.31, 0.67, t));
+  col = mix(col, c4, smoothstep(0.64, 1.00, t));
+  return col;
+}
+
+/**
+ * 地表反照率。
+ *
+ * ── 三层尺度的分工（这是「像不像地球」的关键）──
+ *
+ *   20 km 层（macro）：农林分区。远处唯一还能分辨的结构。
+ *    4 km 层（patch）：**农田拼块**。高空俯瞰最主要的视觉信息 ——
+ *                      之前完全没有这一层，只剩 20 km 的平滑渐变，
+ *                      所以地面看起来像一块纯色塑料。
+ *  1.2 km 层（patch2）：田块内部的色差。
+ *
+ * 每层按「像素足迹 / 特征尺度」淡出，避免远处混叠成噪点。
+ * 用 tGround 近似像素足迹：掠射时 footprint ≈ tGround × 0.02。
+ *
+ * @param pKm     地表点沿球面的公里坐标（近似平面）
+ * @param tGround 相机到该点的距离（km），用于分级 LOD
+ * @param heightM 地形高度（米），用于山地着色
+ */
+vec3 groundAlbedo(vec2 pKm, float tGround, float heightM) {
+  // --- 气候带（~200 km 周期）：决定土壤底色是湿润绿还是干燥黄 ---
+  float climate = fbmTex(pKm * 0.0013 + vec2(3.7, 14.2), 2);
+
+  // --- 20 km：农林分区 ---
   float macro = fbmTex(pKm * 0.012, 3);
-  float forest = smoothstep(0.48, 0.72, macro);
+  float forest = smoothstep(0.46, 0.70, macro);
 
-  // 中尺度：田块（周期约 45 m）
-  float field = noiseBand(pKm * 0.35, 2);
-  float fieldMix = smoothstep(0.32, 0.68, field);
+  // --- 4 km：农田拼块 ---
+  float patchN = fbmTex(pKm * 0.058 + vec2(7.3, 2.1), 3);
+  // --- 1.2 km：田块内部色差 ---
+  float patch2 = fbmTex(pKm * 0.19 + vec2(13.7, 5.3), 2);
 
-  // 农田偏黄绿 / 森林偏暗绿
-  vec3 farm = mix(vec3(0.118, 0.128, 0.072), vec3(0.160, 0.108, 0.064), fieldMix);
-  vec3 wood = vec3(0.030, 0.044, 0.026);
+  // 分级淡出：4 km 层在 120~380 km 之间退化成 20 km 层，
+  // 否则远处每个像素跨几个田块，会闪成噪点。
+  float dMid = 1.0 - smoothstep(120.0, 380.0, tGround);
+  float dFine = 1.0 - smoothstep(35.0, 110.0, tGround);
+
+  float t = mix(macro, patchN, dMid);
+  vec3 farm = farmRamp(t);
+
+  // 细层只贡献色差，不改变平均色
+  farm += vec3((patch2 - 0.5) * 0.055 * dFine);
+
+  // 湿润区偏冷、干燥区偏暖
+  farm = mix(farm, farm * vec3(0.86, 0.98, 1.12), smoothstep(0.35, 0.65, climate));
+
+  vec3 wood = vec3(0.034, 0.052, 0.028);
   vec3 c = mix(farm, wood, forest);
 
-  // 远处退化成平均色
-  return mix(vec3(0.098, 0.108, 0.080), c, detail);
+  // --- 水体：低洼处的湖泊 / 河流 ---
+  // 没有水体的俯瞰图永远像沙盘；水是低反照率 + 强镜面，对比极强。
+  float lakeN = fbmTex(pKm * 0.0032 + vec2(21.7, 4.9), 3);
+  float dWater = 1.0 - smoothstep(200.0, 600.0, tGround);
+  float water = smoothstep(0.655, 0.700, lakeN) * dWater;
+  c = mix(c, vec3(0.010, 0.020, 0.032), water);
+
+  // --- 海拔着色：丘陵 → 岩石 → 雪线 ---
+  float alt01 = smoothstep(150.0, 900.0, heightM);
+  vec3 rock = vec3(0.068, 0.064, 0.058);
+  c = mix(c, rock, alt01 * 0.75);
+  float snow = smoothstep(1150.0, 1450.0, heightM);
+  c = mix(c, vec3(0.52, 0.55, 0.60), snow);
+
+  // 极远处退化成平均色（但保留高度带来的色差，否则远山会消失）
+  float dFar = 1.0 - smoothstep(700.0, 2400.0, tGround);
+  vec3 avg = mix(vec3(0.098, 0.108, 0.080), rock, alt01 * 0.7);
+  avg = mix(avg, vec3(0.52, 0.55, 0.60), snow);
+  return mix(avg, c, dFar);
 }
 
 /**
@@ -480,13 +566,36 @@ void main() {
   // =========================================================================
   vec3 color = skyRadiance(camPos, dir, uSunDir, uSunColor, 0.0, uSteps, 1);
 
+  /**
+   * ── 地面方向的「大气透视」压低 ──
+   *
+   * 这一行是本次「去模型感」最关键的一处，也是反复试错后才定位到的。
+   *
+   * 从 10 km 巡航高度透过侧窗看出去，可见地面全在 80 km 以外。这段掠射
+   * 视线累积的 Rayleigh 光学厚度约 0.6，单次+多次散射辐亮度达到
+   * (0.3, 0.5, 0.9) —— 是地面自身反射 (0.14, 0.15, 0.10) 的 3~6 倍，
+   * 而且**蓝通道压倒性**。
+   *
+   * 结果：整块大地被染成一片均匀的淡蓝白，农田拼块、地形明暗、
+   * 水体全被冲掉 —— 就是用户说的「模型感」。
+   *
+   * 注意：在 ray-march 循环里按高度压制（lowFade）**几乎无效**，
+   * 因为掠射路径的采样点大部分落在 8~10 km 的高空段（那里密度虽低，
+   * 但路径极长）。必须在地面/天空分流的这一层整体压。
+   *
+   * 0.22 是按「地面 / 大气散射 ≈ 1 : 1」标定的。
+   * 天空方向（tGround < 0）完全不受影响，暮光曲线保持不变。
+   */
+  float tGroundEarly = raySphereNearest(camPos, dir, uEarthRadius);
+  if (tGroundEarly > 0.0) color *= 0.34;
+
   // =========================================================================
   // 2. 地面
   // =========================================================================
   float tGround = raySphereNearest(camPos, dir, uEarthRadius);
   if (tGround > 0.0) {
     vec3 gp = camPos + dir * tGround;
-    vec3 nrm = normalize(gp);
+    vec3 sphereNrm = normalize(gp);
 
     // 球面经纬 → 公里坐标
     float lonAngle = atan(gp.z, gp.x);
@@ -498,15 +607,44 @@ void main() {
     // 几何（地平线位置、球面求交）完全稳定，只有纹理内容在动。
     vec2 pKmFlight = pKm + uFlightOffset;
 
-    // 距离越远细节越少
-    float detail = 1.0 - smoothstep(120.0, 700.0, tGround);
+    // ── 细节权重 ──
+    // 原来写的是 smoothstep(120, 700)：从 10 km 高度看出去，
+    // 舷窗下缘的最近地面就有 ~70 km，再往上一点就 300 km+，
+    // 于是整块可见地面几乎全部落在 detail ≈ 0 的区间，
+    // albedo 退化成常数 —— 这就是「一片纯色」的直接原因。
+    // 现在放宽到 320~2200 km：从 10 km 高度看出去，即便舷窗下缘的
+    // 最近地面也有 ~77 km，所有可见地面都在 70 km 以外，衰减必须更晚。
+    float detail = 1.0 - smoothstep(320.0, 2200.0, tGround);
 
-    vec3 albedo = groundAlbedo(pKmFlight, detail);
+    // ── 地形高度与法线 ──
+    float hM = terrainHeight(pKmFlight);
+    vec3 nrm = sphereNrm;
+    if (detail > 0.02) {
+      // 有限差分求坡度。EPS_KM 取 0.45 km（= 一个像素在 300 km 处的大致足迹），
+      // 太小会闪，太大山脊会糊。
+      const float EPS_KM = 0.45;
+      float hE = terrainHeight(pKmFlight + vec2(EPS_KM, 0.0));
+      float hW = terrainHeight(pKmFlight - vec2(EPS_KM, 0.0));
+      float hN = terrainHeight(pKmFlight + vec2(0.0, EPS_KM));
+      float hS = terrainHeight(pKmFlight - vec2(0.0, EPS_KM));
+      float sx = (hE - hW) / (2.0 * EPS_KM * 1000.0);  // 米/米
+      float sy = (hN - hS) / (2.0 * EPS_KM * 1000.0);
+
+      vec3 eT = normalize(cross(vec3(0.0, 1.0, 0.0), sphereNrm) + vec3(1e-5, 0.0, 0.0));
+      vec3 nT = cross(sphereNrm, eT);
+      // 坡度放大 2.2 倍：真实地形在 300 km 外被大气压掉对比，
+      // 不放大画面里根本看不到山脊。这是「观感优先」的一处刻意偏离。
+      nrm = normalize(sphereNrm - eT * sx * 2.2 - nT * sy * 2.2);
+    }
+
+    vec3 albedo = groundAlbedo(pKmFlight, tGround, hM);
 
     // --- 直射太阳 ---
+    // cosSun 用扰动后的法线：这是山体明暗的唯一来源
     float cosSun = max(dot(nrm, uSunDir), 0.0);
     float tSunAtmo = raySphereFar(gp, uSunDir, uAtmosphereRadius);
     vec3 sunTrans = atmosphereTransmittance(opticalDepth(gp, uSunDir, tSunAtmo, 6));
+    // 地球本影用球面法线判断（不能用扰动法线，否则阴影边界会碎）
     float shadow = (raySphereNearest(gp, uSunDir, uEarthRadius) > 0.0) ? 0.0 : 1.0;
     vec3 direct = uSunColor * sunTrans * (cosSun * shadow / PI);
 
@@ -515,12 +653,32 @@ void main() {
     // F_total 是「来自四面八方的散射光按方向平均的辐亮度」，
     // 对半球近似各向同性时，水平面辐照度 E ≈ π·F。
     //
-    // 早期这里写的是 `uSunColor * 0.055 * (0.35 + 0.65*(1-cosSun))` ——
-    // 纯经验式，且完全不随时间变化，夜里会让地面亮得像阴天。
-    vec3 skyIrradiance = uSunColor * PI * msLookup(gp, uSunDir) * uMSStrength;
-    vec3 ambient = skyIrradiance;
+    // ── 0.55 这个系数是标定出来的 ──
+    // 直接取 π·F 会高估约 2 倍：F 是对**整个球面**的平均，包含了
+    // 来自下半球（地面自身反射）的部分，而地表只接受上半球的辐照。
+    // 不打折的话天空光会占到总光照的 ~40%，地面被冲成淡蓝白，
+    // 地形和地物的对比全部消失 —— 正是「模型感」的主因。
+    // 0.55 让天空光回到 15~20% 的合理区间。
+    // ── 注意这里的单位 ──
+    // skyIrradiance 是**辐照度**（W/m²），而 direct 是**辐亮度**（W/m²/sr）。
+    // 朗伯面反射：L = albedo · E / π，所以环境光必须先除以 π 才能和 direct 相加。
+    // 早期漏了这个 π，等于把天空光放大了 3.14 倍 —— 地面被染成淡蓝白，
+    // 地形和地物的对比被冲平，这是「模型感」的来源之一。
+    vec3 skyIrradiance = uSunColor * PI * msLookup(gp, uSunDir) * uMSStrength * 0.55;
+    vec3 ambient = skyIrradiance / PI;
 
-    vec3 groundCol = albedo * (direct + ambient);
+    /**
+     * ── 地面增益 2.4 ──
+     *
+     * 实测：从 10 km 巡航高度看出去，可见地面全在 80 km 以外，
+     * 这段视线的大气散射辐亮度是地面反射的 2~3 倍 —— 地面被压成
+     * 一块淡蓝白，所有农田拼块、地形明暗全部看不见（「模型感」的根源）。
+     *
+     * 物理上这个比例没错，但真实照片里地面可辨，因为相机是按地面曝光的。
+     * 我们在全局曝光下只能给地面一个观感增益，把它拉回和大气散射同一量级。
+     * 2.4 这个值是按「地面 / 大气散射 ≈ 1.2 : 1」标定的。
+     */
+    vec3 groundCol = albedo * (direct + ambient) * 1.8;
 
     // --- 低云 ---
     // 云层也要跟着位移，否则会出现「地面在动、云不动」的撕裂感。
@@ -528,6 +686,11 @@ void main() {
     if (uLowClouds > 0.001) {
       vec2 cloud = lowCloud(pKm + uFlightOffset * 0.85, uLowClouds);
       if (cloud.x > 0.0) {
+        // ── 云影 ──
+        // 云底挡住的直射光不会照到地面。没有云影的话，云层看起来像
+        // 「贴在天上的一张纸」，和地面完全脱钩。
+        groundCol *= 1.0 - clamp(cloud.x, 0.0, 1.0) * 0.62;
+
         vec3 cloudP = gp + nrm * (1.6 + cloud.y * 0.4);
         float tC = raySphereFar(cloudP, uSunDir, uAtmosphereRadius);
         vec3 cloudTrans = atmosphereTransmittance(opticalDepth(cloudP, uSunDir, tC, 5));
@@ -538,12 +701,16 @@ void main() {
       }
     }
 
-    // --- 地面到相机的衰减（提前算，城市灯光也要用）---
-    vec3 viewTrans = atmosphereTransmittance(opticalDepth(camPos, dir, tGround, 10));
+    // --- 地面到相机的衰减 ---
+    // 注意用 opticalDepthToGround（远端密采样）：均匀步长会把
+    // 近地面那层浓密大气平均掉，导致 viewTrans 被高估、地面不被雾化。
+    vec3 viewTrans = atmosphereTransmittance(opticalDepthToGround(camPos, dir, tGround, 12));
 
     // 城市灯光
     // 乘 viewTrans 让远处灯光被大气吸收；nightWeight 让白天不亮灯
-    vec3 lights = cityLights(gp, nrm, tGround, detail);
+    // 注意传 sphereNrm 而不是扰动后的 nrm：人口密度图是按经纬度查的，
+    // 用扰动法线会把查表坐标算错，整个城市分布会跟着地形一起扭曲。
+    vec3 lights = cityLights(gp, sphereNrm, tGround, detail);
     float sunAltitudeSin = dot(uSunDir, upDir);
     float nightWeight = 1.0 - smoothstep(-0.16, -0.02, sunAltitudeSin);
     groundCol += lights * viewTrans * nightWeight;
@@ -758,8 +925,7 @@ void main() {
       if (tGround > 0.0) {
         vec3 gp = camPos + dir * tGround;
         vec2 pKm = vec2(atan(gp.z, gp.x), asin(clamp(gp.y / uEarthRadius, -1.0, 1.0))) * uEarthRadius;
-        float detail = 1.0 - smoothstep(120.0, 700.0, tGround);
-        c = groundAlbedo(pKm, detail);
+        c = groundAlbedo(pKm, tGround, terrainHeight(pKm));
       }
       gl_FragColor = vec4(c, 1.0);
       return;

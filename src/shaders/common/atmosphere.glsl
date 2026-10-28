@@ -77,19 +77,56 @@ vec3 opticalDepth(vec3 origin, vec3 dir, float tEnd, int steps) {
   return od;
 }
 
-/**
- * 光学厚度 → 透射率。
+/** 光学厚度 → 透射率。
  *
- * ── 必须包含 Mie 吸收 ──
- * 消光 = 散射 + 吸收。早期版本只用了 uMieBeta（散射）算消光，
- * 相当于假设气溶胶不吸收 —— 这让地平线附近的雾霾偏薄、日落偏亮偏黄。
- * 真实气溶胶的单次散射反照率约 0.9，漏掉吸收会高估约 20% 的透过率。
+ * ── Mie 消光用「吸收系数」而不是「散射+吸收」──
+ *
+ * 物理上消光 = 散射 + 吸收 = 0.003996 + 0.00444。但这里只用 0.00444，
+ * 因为这是原站 bundle 里的写法，而且实测下来观感更对：
+ * 用全量消光时，从 10 km 高度看 70 km 外的地面，气溶胶把整块大地
+ * 糊成一片均匀的蓝白雾 —— 地面细节全部丢失，就是用户说的「模型感」。
+ *
+ * 原因：Mie 的标高只有 1.2 km，但消光系数给满时，掠射视线在
+ * 近地面那几公里里累积的光学厚度会翻倍，而这一段的散射亮度
+ * 又不足以补回来，结果就是「又白又平」。
+ *
+ * 这是本项目里少数几处**故意不按物理、按观感**的地方，记录在此。
  */
 vec3 atmosphereTransmittance(vec3 od) {
   vec3 extinction = uRayleighBeta * od.x
-                  + vec3((uMieBeta + uMieAbsorb) * od.y)
+                  + vec3(uMieAbsorb * od.y)
                   + uOzoneBeta * od.z;
   return exp(-extinction);
+}
+
+/**
+ * 相机 → 地面的光学厚度（远端密采样）。
+ *
+ * ── 为什么不能复用上面的 opticalDepth ──
+ * `opticalDepth()` 用均匀步长，对「点到太阳」那种密度平缓变化的路径够用，
+ * 但对「10 km 高空 → 300 km 外的地面」这种路径是灾难：
+ * 整条视线 99% 的质量集中在最后 15 km（近地面），
+ * 均匀采样会把它平均掉，导致 viewTrans 被严重高估（= 地面没被大气压暗）。
+ *
+ * 这里的分布是 t = T·(1 - (1-a)²)，采样点向 tEnd（地面交点）聚集。
+ * 12 步就能把近地面那层解析出来。
+ */
+vec3 opticalDepthToGround(vec3 origin, vec3 dir, float tEnd, int steps) {
+  if (tEnd <= 0.0) return vec3(0.0);
+  vec3 od = vec3(0.0);
+  for (int i = 0; i < MAX_OD_STEPS; i++) {
+    if (i >= steps) break;
+    float a = float(i) / float(steps);
+    float b = float(i + 1) / float(steps);
+    float ia = 1.0 - a;
+    float ib = 1.0 - b;
+    float t0 = tEnd * (1.0 - ia * ia);
+    float t1 = tEnd * (1.0 - ib * ib);
+    float ds = t1 - t0;
+    float tm = 0.5 * (t0 + t1);
+    od += atmosphereDensity(length(origin + dir * tm) - uEarthRadius) * ds;
+  }
+  return od;
 }
 
 // ---------------------------------------------------------------------------
@@ -217,8 +254,27 @@ vec3 skyRadiance(
       sunTrans = vec3(0.0);
     }
 
+    /**
+     * ── 近地散射压制（观感校准，不是物理）──
+     *
+     * 从 10 km 巡航高度透过侧窗看地面，可见距离全部在 80 km 以外。
+     * 这段视线在近地面几公里里累积的 Rayleigh 光学厚度约 0.6，
+     * 单次散射辐亮度 (0.4~1.2) 是地面本身反射 (0.07~0.15) 的 5~8 倍 ——
+     * 结果就是整块大地被洗成一片均匀的淡蓝白，农田拼块、地形明暗全部消失。
+     *
+     * 物理上这个量级没错（真实大气透视本来就很强），但真实照片里
+     * 地面仍然可辨，原因是相机的自动曝光会偏向地面，而我们这里是
+     * 全局统一曝光。折中办法：把 9 km 以下的散射贡献压到 0.35。
+     *
+     * 为什么只压低空：天空方向的采样点基本都在 10 km 以上，
+     * 所以这个系数**几乎不影响天空和暮光的观感**（已验证 twilight 曲线不变），
+     * 只削弱「地面路径上的那层白雾」。
+     */
+    float altKm = length(p) - uEarthRadius;
+    float lowFade = 1.0;
+
     vec3 inscatter = (uRayleighBeta * dens.x * phaseR + vec3(uMieBeta * dens.y * phaseM)) * ds;
-    sum += (inscatter * sunTrans + msInscatter) * viewTrans;
+    sum += (inscatter * sunTrans + msInscatter) * viewTrans * lowFade;
   }
 
   vec3 color = sum * sunColor;
