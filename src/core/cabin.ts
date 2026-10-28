@@ -658,7 +658,7 @@ export function createCabin(maxAnisotropy = 4): CabinObjects {
      * 和原站的深灰差了一大截。真实机翼涂装是中性灰（0.35~0.45 反射率），
      * 被强光照亮后才是浅灰，而不是一开始就白。
      */
-    color: 0x5f666e,
+    color: 0x363c46,
     /*
      * roughness / metalness 都设 1.0，交给贴图完全决定：
      *   roughnessMap 的 G 通道：平面 0.32 / 缝底 0.88
@@ -957,7 +957,7 @@ export function createCabin(maxAnisotropy = 4): CabinObjects {
 
   const nacelleMat = new THREE.MeshStandardMaterial({
     // 短舱和机翼同一套涂装，但金属件更多，roughness 略低一点
-    color: 0x6d737b,
+    color: 0x434952,
     roughness: 0.52,
     metalness: 0.08,
     /*
@@ -1169,10 +1169,24 @@ export function createCabin(maxAnisotropy = 4): CabinObjects {
    * 真实客机上机翼根部就在舷窗下方 1~2 m，所以窗口里能看到
    * 翼根、大段翼面、翼尖和小翼。把纵深拉到 1.5 m 才是对的视角。
    */
+  /*
+   * ── 距离：必须有透视收缩 ──
+   *
+   * 之前放在 1.65 m，翼根到翼尖的距离比只有 1 : 2.4 ——
+   * 屏幕上几乎没有「近大远小」，机翼看起来像一块铺满窗口的平板。
+   *
+   * 真实舷窗到机翼 3~10 m，翼尖在 30 m 外，距离比 1 : 4 以上，
+   * 透视收缩才是机翼「有厚度、有纵深」的关键（和面板线无关）。
+   *
+   * 拉到 4.0 m、等比放大到 1.6：
+   *   翼根 NDC ≈ (0.20, -0.40)  窗口右下角外
+   *   翼尖 NDC ≈ (-0.22, -0.12) 窗口内偏左上，且**低于地平线**
+   *   （之前翼尖伸到天空里，这也是「假」的来源之一）
+   */
   wing.position.set(
-    0.25, // 横向：翼根落在窗口右下角外
-    -0.95, // 垂直：翼根在相机下方约 1 m
-    -1.65, // 纵深：贴近真实翼根距离
+    0.80, // 横向：翼根落在窗口右下角外
+    -1.60, // 垂直：翼根在相机下方 1.6 m
+    -4.00, // 纵深：产生明显的近大远小
   );
   /**
    * 整体缩放。
@@ -1181,7 +1195,7 @@ export function createCabin(maxAnisotropy = 4): CabinObjects {
    * 0.55 时翼尖只到 NDC x=0.04（机翼缩在左边一小块），
    * 提到 0.85 才能铺开到窗洞右缘。
    */
-  wing.scale.setScalar(1.05);
+  wing.scale.setScalar(1.60);
   root.add(wing);
 
   // =========================================================================
