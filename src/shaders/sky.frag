@@ -137,8 +137,10 @@ float noiseBand(vec2 uv, int band) {
  * @return 高度（米）
  */
 float terrainHeight(vec2 pKm) {
-  float macro = fbmTex(pKm * 0.0045 + vec2(1.7, 8.3), 3);
-  float hill = fbmTex(pKm * 0.031 + vec2(11.3, 3.1), 3);
+  // 只用 2 个八度：第 3 个八度（波长 3.4 km）在 100 km 外必然混叠成噪点，
+  // 而且每多一个八度就是多一次纹理采样 —— 这是白天卡顿的主要来源之一。
+  float macro = fbmTex(pKm * 0.0045 + vec2(1.7, 8.3), 2);
+  float hill = fbmTex(pKm * 0.031 + vec2(11.3, 3.1), 2);
   float ridgeN = fbmTex(pKm * 0.020 + vec2(5.1, 19.7), 2);
   float ridge = 1.0 - abs(ridgeN * 2.0 - 1.0);
   ridge = ridge * ridge;
@@ -179,22 +181,43 @@ vec3 farmRamp(float t) {
  * @param heightM 地形高度（米），用于山地着色
  */
 vec3 groundAlbedo(vec2 pKm, float tGround, float heightM) {
+  /*
+   * ── 远处 LOD：最省性能的一刀 ──
+   *
+   * 从 10 km 高度看出去，画面里 70% 的地面在 300 km 以外。
+   * 那里一个像素跨 3~8 km，`patch`（4 km）/`patch2`（1.2 km）/`lakeN`
+   * 全部低于奈奎斯特频率 —— 算了也是混叠成噪点，视觉上毫无贡献。
+   *
+   * 但 GPU 不知道这件事，照样每个像素跑完 8 次 fbm（≈20 次纹理采样）。
+   * 这是白天掉帧的主因：远处占了大部分像素，却全是无效计算。
+   *
+   * 这里直接短路成「两层低频 + 平均色」，采样量降到 2 次。
+   */
+  if (tGround > 300.0) {
+    float mLod = fbmTex(pKm * 0.012, 2);
+    vec3 base = farmRamp(mLod);
+    float altL = smoothstep(150.0, 900.0, heightM);
+    base = mix(base, vec3(0.068, 0.064, 0.058), altL * 0.75);
+    base = mix(base, vec3(0.52, 0.55, 0.60), smoothstep(1150.0, 1450.0, heightM));
+    return mix(vec3(0.098, 0.108, 0.080), base, 0.85);
+  }
+
   // --- 气候带（~200 km 周期）：决定土壤底色是湿润绿还是干燥黄 ---
-  float climate = fbmTex(pKm * 0.0013 + vec2(3.7, 14.2), 2);
+  float climate = fbmTex(pKm * 0.0013 + vec2(3.7, 14.2), 1);
 
   // --- 20 km：农林分区 ---
-  float macro = fbmTex(pKm * 0.012, 3);
+  float macro = fbmTex(pKm * 0.012, 2);
   float forest = smoothstep(0.46, 0.70, macro);
 
   // --- 4 km：农田拼块 ---
-  float patchN = fbmTex(pKm * 0.058 + vec2(7.3, 2.1), 3);
+  float patchN = fbmTex(pKm * 0.058 + vec2(7.3, 2.1), 2);
   // --- 1.2 km：田块内部色差 ---
-  float patch2 = fbmTex(pKm * 0.19 + vec2(13.7, 5.3), 2);
+  float patch2 = fbmTex(pKm * 0.19 + vec2(13.7, 5.3), 1);
 
   // 分级淡出：4 km 层在 120~380 km 之间退化成 20 km 层，
   // 否则远处每个像素跨几个田块，会闪成噪点。
-  float dMid = 1.0 - smoothstep(120.0, 380.0, tGround);
-  float dFine = 1.0 - smoothstep(35.0, 110.0, tGround);
+  float dMid = 1.0 - smoothstep(60.0, 200.0, tGround);
+  float dFine = 1.0 - smoothstep(18.0, 55.0, tGround);
 
   float t = mix(macro, patchN, dMid);
   vec3 farm = farmRamp(t);
@@ -210,7 +233,7 @@ vec3 groundAlbedo(vec2 pKm, float tGround, float heightM) {
 
   // --- 水体：低洼处的湖泊 / 河流 ---
   // 没有水体的俯瞰图永远像沙盘；水是低反照率 + 强镜面，对比极强。
-  float lakeN = fbmTex(pKm * 0.0032 + vec2(21.7, 4.9), 3);
+  float lakeN = fbmTex(pKm * 0.0032 + vec2(21.7, 4.9), 2);
   float dWater = 1.0 - smoothstep(200.0, 600.0, tGround);
   float water = smoothstep(0.655, 0.700, lakeN) * dWater;
   c = mix(c, vec3(0.010, 0.020, 0.032), water);
@@ -605,9 +628,11 @@ void main() {
     float detail = 1.0 - smoothstep(320.0, 2200.0, tGround);
 
     // ── 地形高度与法线 ──
-    float hM = terrainHeight(pKmFlight);
+    // 地形高度只对近处有意义：200 km 外一个像素跨 2~4 km，
+    // 再算 1.5 km 尺度的山脊只会得到噪点（这就是白云上那些黑点）。
+    float hM = tGround < 140.0 ? terrainHeight(pKmFlight) : 0.0;
     vec3 nrm = sphereNrm;
-    if (detail > 0.02) {
+    if (detail > 0.02 && tGround < 110.0) {
       // 有限差分求坡度。EPS_KM 取 0.45 km（= 一个像素在 300 km 处的大致足迹），
       // 太小会闪，太大山脊会糊。
       const float EPS_KM = 0.45;
@@ -685,7 +710,7 @@ void main() {
         float cloudShadow = (raySphereNearest(cloudP, uSunDir, uEarthRadius) > 0.0) ? 0.0 : 1.0;
         vec3 cloudLight = uSunColor * cloudTrans * (max(cosSun, 0.0) * cloudShadow / PI);
         vec3 cloudCol = vec3(0.92) * cloudLight + ambient * 0.8;
-        groundCol = mix(groundCol, cloudCol, clamp(cloud.x, 0.0, 1.0) * 0.95);
+        groundCol = mix(groundCol, cloudCol, clamp(cloud.x, 0.0, 1.0));
       }
     }
 
@@ -695,13 +720,20 @@ void main() {
     vec3 viewTrans = atmosphereTransmittance(opticalDepthToGround(camPos, dir, tGround, 12));
 
     // 城市灯光
-    // 乘 viewTrans 让远处灯光被大气吸收；nightWeight 让白天不亮灯
-    // 注意传 sphereNrm 而不是扰动后的 nrm：人口密度图是按经纬度查的，
-    // 用扰动法线会把查表坐标算错，整个城市分布会跟着地形一起扭曲。
-    vec3 lights = cityLights(gp, sphereNrm, tGround, detail);
+    // 乘 viewTrans 让远处灯光被大气吸收；nightWeight 让白天不亮灯。
+    //
+    // ── 白天必须**完全跳过**这段计算 ──
+    // cityLights 内部有 4 次 fbm（≈10 次纹理采样）加多组 hash。
+    // 白天它乘 0，视觉上等于不存在，但 GPU 该算还是要算 ——
+    // 这是白天掉帧最隐蔽的一个来源：画面没变化，帧率却掉一半。
     float sunAltitudeSin = dot(uSunDir, upDir);
     float nightWeight = 1.0 - smoothstep(-0.16, -0.02, sunAltitudeSin);
-    groundCol += lights * viewTrans * nightWeight;
+    if (nightWeight > 0.01) {
+      // 注意传 sphereNrm 而不是扰动后的 nrm：人口密度图是按经纬度查的，
+      // 用扰动法线会把查表坐标算错，整个城市分布会跟着地形一起扭曲。
+      vec3 lights = cityLights(gp, sphereNrm, tGround, detail);
+      groundCol += lights * viewTrans * nightWeight;
+    }
 
     /**
      * ── 这里曾经有一个假的「大气雾」项 ──

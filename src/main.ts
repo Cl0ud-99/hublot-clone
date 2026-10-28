@@ -94,7 +94,7 @@ function main(root: HTMLElement) {
   // 把硬件支持的最大各向异性过滤传给机舱：
   // 机翼面板纹理在掠射角下完全依赖它才能保持清晰
   const cabin = createCabin(renderer.capabilities.getMaxAnisotropy());
-  const { keyLight, fillLight, rimLight, windowLight, cabinLight } = cabin;
+  const { keyLight, fillLight, rimLight, windowLight } = cabin;
 
   const rig = new CameraRig();
 
@@ -400,9 +400,6 @@ function main(root: HTMLElement) {
     // 窗口光：让内壁从窗边到远处有明暗梯度（而不是一块均匀的深灰）。
     // 强度跟着窗外亮度走 —— 白天窗外很亮，内壁被照亮得更多。
     windowLight.intensity = (0.5 + 1.6 * dayness) * cabinScale;
-    // 舱内顶灯：座椅的可见度全靠它。白天几乎不用（窗外光够了），
-    // 暮光/夜间提亮，让转头的观众能看清自己旁边的座位。
-    cabinLight.intensity = (2.5 + 6.0 * (1.0 - dayness)) * cabinScale;
     // 白天偏暖（阳光），夜间偏冷（月光/城市灯光）
     windowLight.color.setRGB(
       0.62 + 0.38 * dayness,
