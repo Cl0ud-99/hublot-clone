@@ -452,8 +452,18 @@ vec3 cityLights(vec3 groundPoint, vec3 normal, float tGround, float detail) {
   // ── 建成区场 ──
   // 人口 × 噪声，得到不规则的城镇轮廓：核心（密而亮）、郊区（稀疏）、荒野（全黑）
   float built = fbmTex(pw * 0.075 + 1.9, 3) * 0.50 + pop * 0.85;
-  float core = smoothstep(0.42, 0.68, built);
-  float outer = smoothstep(0.18, 0.45, built);
+  /*
+   * ── 阈值为什么这么高 ──
+   * 早期是 (0.42,0.68)/(0.18,0.45)，配合 42%~92% 的点亮概率，
+   * 结果是「整块大陆均匀铺满亮点」—— 从 10 km 看下去像撒了一地碎金，
+   * 完全不像真实夜景。
+   *
+   * 真实夜间卫星图是「黑色大陆 + 少数高密度聚落」：
+   * 城市核心极亮，郊区迅速稀疏，广大的农田和林地几乎全黑。
+   * 所以核心阈值提到 0.50~0.76，郊区提到 0.30~0.58。
+   */
+  float core = smoothstep(0.50, 0.76, built);
+  float outer = smoothstep(0.30, 0.58, built);
   if (core + outer < 0.02) return vec3(0.0);
 
   vec3 col = vec3(0.0);
@@ -478,7 +488,7 @@ vec3 cityLights(vec3 groundPoint, vec3 normal, float tGround, float detail) {
   float h2 = hash21(cell + 9.17);
 
   // 点亮概率：核心区约 55%，郊区约 8%
-  float pLit = mix(0.42, 0.92, core) * outer;
+  float pLit = mix(0.10, 0.62, core) * outer;
   float lit = step(1.0 - pLit, h1);
 
   vec2 lp = 0.30 + 0.40 * hash22(cell + 3.71);
