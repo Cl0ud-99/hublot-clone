@@ -23,7 +23,8 @@
 import * as THREE from 'three';
 import { mergeGeometries } from 'three/examples/jsm/utils/BufferGeometryUtils.js';
 import * as C from '../config';
-import { createWingPanelTexture } from './wingTexture';
+import { createWingSurfaceMaps } from './wingTexture';
+import { createSkyEnvTexture } from './skyEnvironment';
 
 /** GLSL 风格 smoothstep（JS 里没有内置） */
 function smoothstepLocal(edge0: number, edge1: number, x: number): number {
@@ -95,6 +96,8 @@ export type CabinObjects = {
   windowLight: THREE.PointLight;
   /** 半球光：天空在上 / 地面在下，给机翼提供方向性环境照明 */
   skyLight: THREE.HemisphereLight;
+  /** 机翼材质（main.ts 按昼夜调 envMapIntensity） */
+  wingMaterial: THREE.MeshStandardMaterial;
   dispose(): void;
 };
 
@@ -579,21 +582,47 @@ export function createCabin(maxAnisotropy = 4): CabinObjects {
    * 所以贴上去之后「只有缝变暗，其他区域保持原色」——
    * 这正是我们要的效果，不需要额外调整 color。
    */
-  const wingPanelTex = createWingPanelTexture(maxAnisotropy);
-  disposables.push(wingPanelTex);
+  /*
+   * ── 机翼表面：颜色 + 法线 + 粗糙度 三张图 ──
+   *
+   * 之前只有颜色图，面板缝只是一条画上去的暗线：
+   * 法线没变、粗糙度没变，光照打上去和平面完全一样 ——
+   * 所以整片机翼看起来像一块印花塑料板。
+   *
+   * 现在三张图来自**同一套布局**，缝的位置严格对齐：
+   *   color     → 缝底进阴影
+   *   normal    → 凹槽两壁产生明暗
+   *   roughness → 缝里粗糙（高光断掉），平面光滑（高光连续）
+   */
+  const wingSurfaces = createWingSurfaceMaps(maxAnisotropy);
+  disposables.push(wingSurfaces.color, wingSurfaces.normal, wingSurfaces.roughness);
+
+  /*
+   * ── 环境反射：去掉塑料感的最后一块 ──
+   * 没有 envMap 时，metalness≈0 的材质只有光源的 GGX 高光，
+   * 完全没有「映出天空」这一项。真实机翼会映出整个上半球的渐变，
+   * 那是「涂装」和「塑料」最直接的差别。
+   */
+  const skyEnv = createSkyEnvTexture(1);
+  disposables.push(skyEnv);
 
   const wingMat = new THREE.MeshStandardMaterial({
     color: 0x9aa0a8,
     /*
-     * ── roughness 从 0.72 降到 0.38 ──
-     * 0.72 的粗糙度下，GGX 高光被摊得很开，整片翼面几乎同一个亮度 ——
-     * 这就是「全程一个反光」的直接原因。
-     * 真实机翼是光滑涂装（roughness ≈ 0.3~0.4），太阳会在前缘的圆弧上
-     * 收成一条细高光带，前缘亮、后缘暗，翼面才有厚度。
+     * roughness / metalness 都设 1.0，交给贴图完全决定：
+     *   roughnessMap 的 G 通道：平面 0.32 / 缝底 0.88
+     *   metalnessMap 的 B 通道：恒 0（涂装是绝缘层）
+     * 如果这里再给个 0.46，会和贴图相乘变成 0.15，又回到镜面塑料。
      */
-    roughness: 0.46,
-    metalness: 0.04,
-    map: wingPanelTex,
+    roughness: 1.0,
+    metalness: 1.0,
+    map: wingSurfaces.color,
+    normalMap: wingSurfaces.normal,
+    normalScale: new THREE.Vector2(1.15, 1.15),
+    roughnessMap: wingSurfaces.roughness,
+    metalnessMap: wingSurfaces.roughness,
+    envMap: skyEnv,
+    envMapIntensity: 1.0,
     side: THREE.DoubleSide,
   });
   disposables.push(wingMat);
@@ -1036,6 +1065,7 @@ export function createCabin(maxAnisotropy = 4): CabinObjects {
     rimLight,
     windowLight,
     skyLight,
+    wingMaterial: wingMat,
     dispose() {
       wallGeo.dispose();
       wallMat.dispose();

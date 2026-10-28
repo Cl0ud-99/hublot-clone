@@ -94,7 +94,7 @@ function main(root: HTMLElement) {
   // 把硬件支持的最大各向异性过滤传给机舱：
   // 机翼面板纹理在掠射角下完全依赖它才能保持清晰
   const cabin = createCabin(renderer.capabilities.getMaxAnisotropy());
-  const { keyLight, fillLight, rimLight, windowLight, skyLight } = cabin;
+  const { keyLight, fillLight, rimLight, windowLight, skyLight, wingMaterial } = cabin;
 
   const rig = new CameraRig();
 
@@ -411,6 +411,14 @@ function main(root: HTMLElement) {
      *    会让机翼在全天保持同一个亮度，那才是「假」的根源。
      */
     skyLight.intensity = (0.12 + 0.70 * dayness) * cabinScale;
+    /**
+     * 机翼的环境反射强度。
+     *
+     * 环境贴图本身是「白天天空」的固定颜色，所以必须：
+     *  1) 乘 cabinScale 抵消自动曝光（和所有灯一样）
+     *  2) 乘 dayness —— 夜里天空不发光，机翼当然不该映出蓝天
+     */
+    wingMaterial.envMapIntensity = (0.18 + 0.82 * dayness) * cabinScale;
     // 白天偏暖（阳光），夜间偏冷（月光/城市灯光）
     windowLight.color.setRGB(
       0.62 + 0.38 * dayness,
