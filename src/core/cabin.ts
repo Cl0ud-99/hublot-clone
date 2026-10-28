@@ -281,7 +281,7 @@ export function createCabin(maxAnisotropy = 4): CabinObjects {
 
   // 内壁材质：哑光塑料 + 窗边被外部光照亮的边缘
   const wallMat = new THREE.MeshStandardMaterial({
-    color: 0x2a2a2e,
+    color: 0x30343c,
     roughness: 0.85,
     metalness: 0.0,
     side: THREE.DoubleSide,
@@ -294,8 +294,8 @@ export function createCabin(maxAnisotropy = 4): CabinObjects {
 
   // --- 窗玻璃边框装饰：每个窗洞加一圈更亮的边 ---
   const trimMat = new THREE.MeshStandardMaterial({
-    color: 0x4a4a50,
-    roughness: 0.55,
+    color: 0x565b66,
+    roughness: 0.48,
     metalness: 0.1,
     side: THREE.DoubleSide,
   });
@@ -308,7 +308,7 @@ export function createCabin(maxAnisotropy = 4): CabinObjects {
   for (let i = 0; i < HOLE_COUNT_ODD; i++) {
     const cx = (i - (HOLE_COUNT_ODD - 1) / 2) * ROW_PITCH_M;
     const trimShape = new THREE.Shape();
-    const outer = roundedRect(cx, 0, W.width + 0.022, W.height + 0.022, W.radius + 0.011);
+    const outer = roundedRect(cx, 0, W.width + 0.034, W.height + 0.034, W.radius + 0.017);
     trimShape.curves = outer.curves;
     const inner = roundedRect(cx, 0, W.width - 0.004, W.height - 0.004, W.radius - 0.002);
     trimShape.holes.push(inner);
@@ -317,13 +317,15 @@ export function createCabin(maxAnisotropy = 4): CabinObjects {
       bevelEnabled: false,
       curveSegments: 16,
     });
-    trimGeo.translate(0, 0, WALL_Z + 0.002);
+    // 略微凸出墙面 4 mm：真实窗框是压在壁板上的一个「圈」，
+    // 完全齐平会显得像贴纸；凸一点才能在外圈投出细阴影。
+    trimGeo.translate(0, 0, WALL_Z + 0.004);
     trimParts.push(trimGeo);
 
     // 窗洞内斜面：把「纸板挖洞」变成「真实窗框」
     // 注意要和 trim 分开合并：ExtrudeGeometry 带 uv，bezel 没有，
     // mergeGeometries 要求所有几何属性完全一致，混在一起会直接失败。
-    bezelParts.push(buildBezelGeometry(cx, W.width, W.height, W.radius, 0.012, 0.030, 24));
+    bezelParts.push(buildBezelGeometry(cx, W.width, W.height, W.radius, 0.016, 0.048, 28));
   }
   const trimMerged = mergeGeometries(trimParts, false);
   trimParts.forEach((g) => g.dispose());
