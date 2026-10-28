@@ -485,8 +485,18 @@ export function createCabin(maxAnisotropy = 4): CabinObjects {
 
         // 上表面
         const upperY = (yc + yt) * chord;
-        // 弦向位置：前缘在 u=0 处，向后为正
-        let cz = u * chord;
+        /**
+         * ── 弦向：向后为「−Z」──
+         *
+         * 机翼绕 Y 轴转到 123° 之后，局部 +Z 在世界里指向 (+X, −Z)，
+         * 而 +X 是**机头方向**。如果弦向仍是 +Z，翼型的后缘就会朝机头、
+         * 前缘朝机尾 —— 视觉上等于「乘客面朝机尾坐着」，
+         * 也就是用户说的「背对驾驶室」。
+         *
+         * 取负值后前缘仍固定在 u=0（位置不变），后缘转向 −Z →
+         * 世界 (−X, +Z)，后缘朝向机尾，符合真实座舱。
+         */
+        let cz = -u * chord;
 
         // 施加扭转（绕翼展轴旋转）
         const cosT = Math.cos(twist);
@@ -505,7 +515,8 @@ export function createCabin(maxAnisotropy = 4): CabinObjects {
         const yc = camber * 4 * u * (1 - u);
 
         const lowerY = (yc - yt) * chord;
-        let cz = u * chord;
+        // 与上表面一致：弦向朝 −Z（后缘朝机尾）
+        let cz = -u * chord;
 
         const cosT = Math.cos(twist);
         const sinT = Math.sin(twist);
@@ -850,7 +861,8 @@ export function createCabin(maxAnisotropy = 4): CabinObjects {
       // 后缘：弦向 u=1，翼型厚度 yt=0，所以 y 只受扭转影响
       const chord = WING_CHORD_ROOT * (1 - (1 - TAPER_RATIO) * t);
       const twist = WASHOUT * t;
-      const cz = chord;
+      // 后缘在弦向的末端：弦向已改为 −Z，所以这里取 −chord
+      const cz = -chord;
       const ry = -cz * Math.sin(twist);
       const rz = cz * Math.cos(twist);
       pts.push(new THREE.Vector3(x, y + ry, Math.tan(SWEEP) * x + rz));
