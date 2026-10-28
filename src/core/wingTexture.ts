@@ -21,7 +21,19 @@
 
 import * as THREE from 'three';
 
-/** 画一条带柔和边缘的细线（模拟真实缝隙的微阴影） */
+/**
+ * 画一条「凹缝」—— 暗线 + 一侧亮边。
+ *
+ * ── 为什么不能只画一条黑线 ──
+ * 只加深黑线会让机翼看起来像用马克笔描过边，是典型的「卡通化」翻车。
+ *
+ * 真实蒙皮缝隙是一个**凹陷**：缝底在阴影里（暗），
+ * 而缝隙的一侧边缘会因为受光而略亮。这个「暗-亮」配对
+ * 才是人眼识别「这是凹槽而不是画上去的线」的依据。
+ *
+ * @param offsetSign 亮边相对暗线的偏移方向（+1 / -1），
+ *   配合下面的垂直方向决定亮边画在哪一侧。
+ */
 function softLine(
   ctx: CanvasRenderingContext2D,
   x1: number,
@@ -30,17 +42,40 @@ function softLine(
   y2: number,
   width: number,
   alpha: number,
+  highlight = false,
 ) {
   ctx.save();
+  ctx.lineCap = 'round';
+
+  // 暗缝本体
   ctx.strokeStyle = `rgba(0, 0, 0, ${alpha})`;
   ctx.lineWidth = width;
-  ctx.lineCap = 'round';
   // 轻微模糊：真实缝隙不是硬边，而是有半影
   ctx.filter = 'blur(0.6px)';
   ctx.beginPath();
   ctx.moveTo(x1, y1);
   ctx.lineTo(x2, y2);
   ctx.stroke();
+
+  if (highlight) {
+    // 亮边：沿垂直于线段的方向偏移约 0.7 个线宽
+    const dx = x2 - x1;
+    const dy = y2 - y1;
+    const len = Math.hypot(dx, dy) || 1;
+    // 垂直单位向量
+    const nx = -dy / len;
+    const ny = dx / len;
+    const off = width * 0.7;
+
+    ctx.strokeStyle = `rgba(255, 255, 255, ${alpha * 0.85})`;
+    ctx.lineWidth = Math.max(1.5, width * 0.45);
+    ctx.filter = 'blur(0.8px)';
+    ctx.beginPath();
+    ctx.moveTo(x1 + nx * off, y1 + ny * off);
+    ctx.lineTo(x2 + nx * off, y2 + ny * off);
+    ctx.stroke();
+  }
+
   ctx.restore();
 }
 
@@ -90,21 +125,21 @@ export function createWingPanelTexture(
   // 3 px / 1024 × 110 px ≈ 0.3 屏幕像素 —— 亚像素级，
   // mipmap 直接把它抹成平均值，完全看不见。
   //
-  // 所以这里必须按「视觉可读」而不是「物理真实」来定线宽：
-  // 主缝 10~14 px（约 1.2~1.6 屏幕像素），次要缝 6~8 px。
-  // 实测这是让面板线在舷窗距离下刚好能看出来的区间。
-  const chordwiseLines: Array<[number, number, number]> = [
-    // [u 位置, 线宽 px, 透明度]
-    [0.055, 13, 0.42], // 缝翼后缘缝（最明显）
-    [0.085, 8, 0.30], // 缝翼滑轨盖板边界
-    [0.30, 7, 0.26], // 前梁检修口
-    [0.48, 7, 0.24], // 中央翼盒
-    [0.64, 11, 0.36], // 襟翼/扰流板铰链线
-    [0.86, 7, 0.26], // 后缘检修口
-    [0.94, 9, 0.32], // 襟翼后缘
+  // 所以这里必须按「视觉可读」而不是「物理真实」来定线宽。
+  // 第二轮加强：线宽 +2px、透明度提升约 60%，并给主缝加亮边。
+  // 实测基线标准差只有 1.7（几乎平纸），目标是 4~8。
+  const chordwiseLines: Array<[number, number, number, boolean]> = [
+    // [u 位置, 线宽 px, 透明度, 是否加亮边]
+    [0.055, 15, 0.68, true], // 缝翼后缘缝（最明显）
+    [0.085, 10, 0.48, true], // 缝翼滑轨盖板边界
+    [0.30, 9, 0.44, false], // 前梁检修口
+    [0.48, 9, 0.42, false], // 中央翼盒
+    [0.64, 13, 0.60, true], // 襟翼/扰流板铰链线
+    [0.86, 9, 0.44, false], // 后缘检修口
+    [0.94, 11, 0.52, true], // 襟翼后缘
   ];
-  for (const [u, w, a] of chordwiseLines) {
-    softLine(ctx, u * width, 0, u * width, height, w, a);
+  for (const [u, w, a, hl] of chordwiseLines) {
+    softLine(ctx, u * width, 0, u * width, height, w, a, hl);
   }
 
   // ── 展向面板线（纹理上是横线）──
@@ -112,7 +147,7 @@ export function createWingPanelTexture(
   const spanwiseCount = 9;
   for (let i = 1; i < spanwiseCount; i++) {
     const v = i / spanwiseCount;
-    softLine(ctx, 0, v * height, width, v * height, 7, 0.26);
+    softLine(ctx, 0, v * height, width, v * height, 9, 0.48, i % 3 === 0);
   }
 
   // ── 扰流板（spoiler）面板轮廓 ──
@@ -130,23 +165,23 @@ export function createWingPanelTexture(
     const y0 = v0 * height;
     const y1 = v1 * height;
     // 轮廓比普通缝略明显
-    softLine(ctx, x0, y0, x1, y0, 8, 0.34);
-    softLine(ctx, x1, y0, x1, y1, 8, 0.34);
-    softLine(ctx, x1, y1, x0, y1, 8, 0.34);
-    softLine(ctx, x0, y1, x0, y0, 8, 0.34);
+    softLine(ctx, x0, y0, x1, y0, 10, 0.55, true);
+    softLine(ctx, x1, y0, x1, y1, 10, 0.55, true);
+    softLine(ctx, x1, y1, x0, y1, 10, 0.55, true);
+    softLine(ctx, x0, y1, x0, y0, 10, 0.55, true);
   }
 
   // ── 襟翼滑轨盖板（flap track fairing 的根部）──
   // 机翼后缘有 3 个滑轨整流罩，在翼面上留下三条短的分割线
   const trackV = [0.22, 0.5, 0.78];
   for (const v of trackV) {
-    softLine(ctx, 0.64 * width, v * height, 0.9 * width, v * height, 9, 0.30);
+    softLine(ctx, 0.64 * width, v * height, 0.9 * width, v * height, 11, 0.50, true);
   }
 
   // ── 前缘：一条略深的带 ──
   // 前缘是铝合金裸露区（防冰带），颜色比涂装深
   const leadingGrad = ctx.createLinearGradient(0, 0, 0.055 * width, 0);
-  leadingGrad.addColorStop(0, 'rgba(0, 0, 0, 0.30)');
+  leadingGrad.addColorStop(0, 'rgba(0, 0, 0, 0.45)');
   leadingGrad.addColorStop(1, 'rgba(0, 0, 0, 0)');
   ctx.fillStyle = leadingGrad;
   ctx.fillRect(0, 0, 0.055 * width, height);
