@@ -90,7 +90,9 @@ function main(root: HTMLElement) {
   sky.mesh.renderOrder = -1000;
   scene.add(sky.mesh);
 
-  const cabin = createCabin();
+  // 把硬件支持的最大各向异性过滤传给机舱：
+  // 机翼面板纹理在掠射角下完全依赖它才能保持清晰
+  const cabin = createCabin(renderer.capabilities.getMaxAnisotropy());
   const { keyLight, fillLight, rimLight, windowLight } = cabin;
 
   const rig = new CameraRig();

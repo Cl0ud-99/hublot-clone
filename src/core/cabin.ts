@@ -22,6 +22,7 @@
 
 import * as THREE from 'three';
 import * as C from '../config';
+import { createWingPanelTexture } from './wingTexture';
 
 /** 圆角矩形路径（用于窗洞和面板轮廓） */
 function roundedRect(
@@ -116,8 +117,11 @@ export function seatOffsetForRow(row: number): THREE.Vector3 {
  *   x = 沿机身（座位排数方向）
  *   y = 上下
  *   z = 向外（窗在 -z 方向，因为 three 相机看向 -Z）
+ *
+ * @param maxAnisotropy 硬件支持的最大各向异性过滤倍数。
+ *   机翼面板纹理在掠射角下需要它才能保持清晰（见 wingTexture.ts 的说明）。
  */
-export function createCabin(): CabinObjects {
+export function createCabin(maxAnisotropy = 4): CabinObjects {
   const root = new THREE.Group();
   root.name = 'cabin';
 
@@ -294,11 +298,22 @@ export function createCabin(): CabinObjects {
    */
   function buildLoftedWing(spanStations = 24, chordStations = 28): THREE.BufferGeometry {
     const positions: number[] = [];
-    const normals: number[] = [];
+    const uvs: number[] = [];
     const indices: number[] = [];
 
     // 每个站位生成一圈翼型点（上表面从后到前，下表面从前到后）
     const rings: Array<Array<[number, number, number]>> = [];
+    /**
+     * 与 rings 一一对应的 UV。
+     *
+     * u = 弦向比例（0 = 前缘，1 = 后缘）
+     * v = 展向比例（0 = 翼根，1 = 翼尖）
+     *
+     * 这套 UV 用于贴面板分割线纹理。之所以用「比例」而不是「物理距离」：
+     *   - 弦向面板线本来就跟着翼型走，会随收缩自然收敛（真实机翼就是这样）
+     *   - 展向是线性的，比例 = 物理距离，所以等距分割是对的
+     */
+    const ringUvs: Array<Array<[number, number]>> = [];
 
     for (let s = 0; s <= spanStations; s++) {
       const t = s / spanStations; // 0 = 翼根, 1 = 翼尖
@@ -334,6 +349,7 @@ export function createCabin(): CabinObjects {
       const zSweep = Math.tan(SWEEP) * x;
 
       const ring: Array<[number, number, number]> = [];
+      const ringUv: Array<[number, number]> = [];
       // 用余弦分布：前后缘加密，符合 CFD 网格惯例
       for (let c = 0; c <= chordStations; c++) {
         const u = (1 - Math.cos((c / chordStations) * Math.PI)) * 0.5; // 0..1 从前缘到后缘
@@ -354,6 +370,7 @@ export function createCabin(): CabinObjects {
         const rz = upperY * sinT + cz * cosT;
 
         ring.push([x, y + ry, zSweep + rz]);
+        ringUv.push([u, t]);
       }
       // 下表面（从后缘回到前缘，跳过两端避免重复）
       for (let c = chordStations - 1; c > 0; c--) {
@@ -371,8 +388,10 @@ export function createCabin(): CabinObjects {
         const rz = lowerY * sinT + cz * cosT;
 
         ring.push([x, y + ry, zSweep + rz]);
+        ringUv.push([u, t]);
       }
       rings.push(ring);
+      ringUvs.push(ringUv);
     }
 
     // 把相邻两个站位的环连成四边形（拆成两个三角形）
@@ -402,13 +421,19 @@ export function createCabin(): CabinObjects {
      */
     const capRing = (ringIndex: number, flip: boolean) => {
       const ring = rings[ringIndex];
+      const ringUv = ringUvs[ringIndex];
       // 扇心：环上所有顶点的平均
       let cx = 0, cy = 0, cz = 0;
       for (const [px, py, pz] of ring) { cx += px; cy += py; cz += pz; }
       cx /= ring.length; cy /= ring.length; cz /= ring.length;
+      // 扇心的 UV 取环上平均（端面用不到纹理细节，给个合理值即可）
+      let cu = 0, cv = 0;
+      for (const [u, v] of ringUv) { cu += u; cv += v; }
+      cu /= ringUv.length; cv /= ringUv.length;
 
       const centerIdx = positions.length / 3;
       positions.push(cx, cy, cz);
+      uvs.push(cu, cv);
 
       const base = ringIndex * ringLen;
       for (let c = 0; c < ringLen; c++) {
@@ -421,18 +446,25 @@ export function createCabin(): CabinObjects {
       }
     };
 
-    // 先把所有环的顶点写进 positions（封口需要基于已写入的索引）
-    for (const ring of rings) for (const [px, py, pz] of ring) positions.push(px, py, pz);
+    // 先把所有环的顶点写进 positions/uvs（封口需要基于已写入的索引）
+    for (let r = 0; r < rings.length; r++) {
+      const ring = rings[r];
+      const ringUv = ringUvs[r];
+      for (let i = 0; i < ring.length; i++) {
+        positions.push(ring[i][0], ring[i][1], ring[i][2]);
+        uvs.push(ringUv[i][0], ringUv[i][1]);
+      }
+    }
     // 翼根封口（朝 -x，所以翻转）与翼尖封口（朝 +x）
     capRing(0, true);
     capRing(spanStations, false);
 
     const geo = new THREE.BufferGeometry();
     geo.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
+    geo.setAttribute('uv', new THREE.Float32BufferAttribute(uvs, 2));
     geo.setIndex(indices);
     // 法线由几何自动计算（放样面不是平面，必须用 computeVertexNormals）
     geo.computeVertexNormals();
-    void normals;
 
     return geo;
   }
@@ -453,17 +485,84 @@ export function createCabin(): CabinObjects {
    *   2) roughness 提高。涂装是哑光的，高光应该散开而不是镜面反射。
    *   3) metalness 保持接近 0。涂装是绝缘层，金属度高的材质
    *      在没有环境贴图时会变成死黑（这也是之前机翼发暗的原因）。
+   *
+   * ── 面板线纹理 ──
+   * map 会与 color 相乘。纹理底色是白色（1.0），缝的位置是深色，
+   * 所以贴上去之后「只有缝变暗，其他区域保持原色」——
+   * 这正是我们要的效果，不需要额外调整 color。
    */
+  const wingPanelTex = createWingPanelTexture(maxAnisotropy);
+  disposables.push(wingPanelTex);
+
   const wingMat = new THREE.MeshStandardMaterial({
     color: 0x9aa0a8,
     roughness: 0.72,
     metalness: 0.02,
+    map: wingPanelTex,
     side: THREE.DoubleSide,
   });
   disposables.push(wingMat);
 
   const wingMesh = new THREE.Mesh(wingGeo, wingMat);
   wing.add(wingMesh);
+
+  // =========================================================================
+  // 2a. 襟翼滑轨整流罩（flap track fairing）
+  //
+  // ── 为什么这是机翼上最有辨识度的细节 ──
+  // 从舷窗看机翼，后缘下方会伸出 3~4 个「独木舟形状」的整流罩 ——
+  // 里面包着襟翼的传动滑轨。它们破坏了机翼后缘那条笔直的轮廓线，
+  // 是判断「这是一架真实客机」最强的视觉线索之一。
+  //
+  // 形状：细长的纺锤形，前端圆钝、后端收尖，长度约弦长的 45%。
+  // 这里用「缩放后的球体」来近似 —— 比 Lathe 便宜，而且在这个距离下
+  // 完全看不出差别。
+  // =========================================================================
+  {
+    const fairingMat = new THREE.MeshStandardMaterial({
+      color: 0x8e949c,
+      roughness: 0.7,
+      metalness: 0.03,
+      side: THREE.DoubleSide,
+    });
+    disposables.push(fairingMat);
+
+    // 球体基础几何（所有整流罩共用）
+    const baseGeo = new THREE.SphereGeometry(1, 14, 10);
+    disposables.push(baseGeo);
+
+    /**
+     * 滑轨位置（展向比例）。
+     * 真实 737 有 3 个主滑轨，分布在后缘靠外的位置。
+     * 注意要避开翼根（那里被窗框挡住）和翼尖（那里只有小翼）。
+     */
+    const trackPositions = [0.26, 0.5, 0.72];
+
+    for (const tv of trackPositions) {
+      const fairing = new THREE.Mesh(baseGeo, fairingMat);
+
+      // 该站位在机翼本地坐标里的位置
+      const localX = tv * WING_SPAN;
+      const localY = Math.tan(DIHEDRAL) * localX;
+      const localZ = Math.tan(SWEEP) * localX;
+
+      // 该站位的弦长（与放样保持一致的收缩）
+      const chordHere = WING_CHORD_ROOT * (1 - (1 - TAPER_RATIO) * tv);
+
+      // 放在后缘附近：弦向 78% 处，略低于翼面
+      fairing.position.set(
+        localX,
+        localY - 0.055,
+        localZ + chordHere * 0.78,
+      );
+      // 纺锤形：弦向长（z）、横向窄（x）、上下扁（y）
+      fairing.scale.set(0.055, 0.052, chordHere * 0.24);
+      // 顺着后掠角略微偏转，让长轴沿着弦向
+      fairing.rotation.y = -SWEEP;
+
+      wing.add(fairing);
+    }
+  }
 
   // --- 翼梢小翼（翼尖向上翘起的延伸段）---
   //
