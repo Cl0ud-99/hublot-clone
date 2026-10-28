@@ -94,7 +94,7 @@ function main(root: HTMLElement) {
   // 把硬件支持的最大各向异性过滤传给机舱：
   // 机翼面板纹理在掠射角下完全依赖它才能保持清晰
   const cabin = createCabin(renderer.capabilities.getMaxAnisotropy());
-  const { keyLight, fillLight, rimLight, windowLight } = cabin;
+  const { keyLight, fillLight, rimLight, windowLight, skyLight } = cabin;
 
   const rig = new CameraRig();
 
@@ -400,6 +400,17 @@ function main(root: HTMLElement) {
     // 窗口光：让内壁从窗边到远处有明暗梯度（而不是一块均匀的深灰）。
     // 强度跟着窗外亮度走 —— 白天窗外很亮，内壁被照亮得更多。
     windowLight.intensity = (0.5 + 1.6 * dayness) * cabinScale;
+    /**
+     * 半球光（天空/地面环境光）。
+     *
+     * 两个要点：
+     * 1) **必须进曝光补偿**。漏掉它的话，暮光档位（exposure≈466）
+     *    会把它放大 466 倍，整个画面直接爆白 —— 这个坑踩第二次了。
+     * 2) 强度要跟 dayness 走，不能恒定。它模拟的是天空辐照度，
+     *    暮光时天空本身暗了几百倍，机翼当然也该暗；只靠 cabinScale
+     *    会让机翼在全天保持同一个亮度，那才是「假」的根源。
+     */
+    skyLight.intensity = (0.12 + 0.70 * dayness) * cabinScale;
     // 白天偏暖（阳光），夜间偏冷（月光/城市灯光）
     windowLight.color.setRGB(
       0.62 + 0.38 * dayness,

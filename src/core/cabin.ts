@@ -93,6 +93,8 @@ export type CabinObjects = {
   rimLight: THREE.DirectionalLight;
   /** 窗口光：让内壁从窗边到远处有明暗梯度 */
   windowLight: THREE.PointLight;
+  /** 半球光：天空在上 / 地面在下，给机翼提供方向性环境照明 */
+  skyLight: THREE.HemisphereLight;
   dispose(): void;
 };
 
@@ -582,8 +584,15 @@ export function createCabin(maxAnisotropy = 4): CabinObjects {
 
   const wingMat = new THREE.MeshStandardMaterial({
     color: 0x9aa0a8,
-    roughness: 0.72,
-    metalness: 0.02,
+    /*
+     * ── roughness 从 0.72 降到 0.38 ──
+     * 0.72 的粗糙度下，GGX 高光被摊得很开，整片翼面几乎同一个亮度 ——
+     * 这就是「全程一个反光」的直接原因。
+     * 真实机翼是光滑涂装（roughness ≈ 0.3~0.4），太阳会在前缘的圆弧上
+     * 收成一条细高光带，前缘亮、后缘暗，翼面才有厚度。
+     */
+    roughness: 0.46,
+    metalness: 0.04,
     map: wingPanelTex,
     side: THREE.DoubleSide,
   });
@@ -980,6 +989,22 @@ export function createCabin(maxAnisotropy = 4): CabinObjects {
   const fillLight = new THREE.AmbientLight(0x2a3550, 0.35);
   root.add(fillLight);
 
+  /**
+   * 半球光（新增）：模拟「天空在上、地面在下」的方向性环境光。
+   *
+   * AmbientLight 是各向同性的 —— 它把机翼上表面和下表面照得一样亮，
+   * 翼面因此完全没有体积感。真实机翼在 10 km 高空，上表面接收整个
+   * 上半球的天空辐照（亮、偏蓝），下表面只接收地面反射（暗、偏暖）。
+   *
+   * HemisphereLight 正好表达这件事：朝上的法线取到 skyColor，
+   * 朝下的取到 groundColor，中间平滑插值。
+   * 机翼有上反 5.5° + 扭转 -3°，各截面法线不同 → 自然出现
+   * 「翼根到翼尖」的明暗渐变。
+   */
+  const skyLight = new THREE.HemisphereLight(0x9dbde8, 0x1c2026, 0.82);
+  skyLight.position.set(0, 1, 0);
+  root.add(skyLight);
+
   // 轮廓光：让内壁边缘有一点分离感
   const rimLight = new THREE.DirectionalLight(0xaabbdd, 0.25);
   rimLight.position.set(1.5, -1.0, 1.0);
@@ -1010,6 +1035,7 @@ export function createCabin(maxAnisotropy = 4): CabinObjects {
     fillLight,
     rimLight,
     windowLight,
+    skyLight,
     dispose() {
       wallGeo.dispose();
       wallMat.dispose();
