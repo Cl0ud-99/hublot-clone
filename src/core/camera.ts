@@ -262,8 +262,13 @@ export class CameraRig {
     const z = p.pd * 0.01;
 
     // 「框景」模式贴近窗玻璃、视线居中。REV: pane 模式 lookAt 为 3°/3°
-    const yawDeg = p.hublot ? p.yaw : 3;
-    const pitchDeg = p.hublot ? p.pitch : 3;
+    //
+    // ── 为什么这里还要 clamp 一次 ──
+    // pane 里的滑块范围只是 UI 约束，URL 参数（?yaw=120）可以绕过它。
+    // 舱内只建了 ±40° / ±28° 以内的结构，超出就是穿帮，所以在这里硬钳。
+    const viewLimit = p.hublot;
+    const yawDeg = viewLimit ? Math.max(-55, Math.min(55, p.yaw)) : 3;
+    const pitchDeg = viewLimit ? Math.max(-32, Math.min(32, p.pitch)) : 3;
 
     return {
       offset: new THREE.Vector3(x, y, z),

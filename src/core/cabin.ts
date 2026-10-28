@@ -21,6 +21,8 @@
  */
 
 import * as THREE from 'three';
+import { RoundedBoxGeometry } from 'three/examples/jsm/geometries/RoundedBoxGeometry.js';
+import { mergeGeometries } from 'three/examples/jsm/utils/BufferGeometryUtils.js';
 import * as C from '../config';
 import { createWingPanelTexture } from './wingTexture';
 
@@ -86,6 +88,8 @@ export type CabinObjects = {
   rimLight: THREE.DirectionalLight;
   /** 窗口光：让内壁从窗边到远处有明暗梯度 */
   windowLight: THREE.PointLight;
+  /** 舱内顶灯：照亮座椅与过道（新增） */
+  cabinLight: THREE.PointLight;
   dispose(): void;
 };
 
@@ -877,6 +881,189 @@ export function createCabin(maxAnisotropy = 4): CabinObjects {
   root.add(wing);
 
   // =========================================================================
+  // 3. 舱内结构（座椅 / 地板 / 天花 / 行李架 / 隔板）
+  //
+  // ── 为什么必须建 ──
+  // 之前舱内只有一块开了洞的内壁：抬头、低头、左右转头全是纯黑。
+  // 一旦 yaw 放宽，看到的就是「一条无尽的黑走廊 + 一排排空窗洞」——
+  // 这是最典型的穿帮。
+  //
+  // ── 范围就是这么小（省性能的核心）──
+  // 只建「转头 ±40° 以内看得见」的那一小块：
+  //   x ∈ [-1.95, +1.95]   前后各两排座椅
+  //   z ∈ [-0.02, 1.45]    侧壁 → 过道
+  //   y ∈ [-0.82, 0.98]    地板 → 行李架顶
+  // 再往外用隔板封死，用户永远看不到后面，也就不用建。
+  //
+  // 对比一下：如果按「真实机舱」建 30 排、双通道、厨房、洗手间，
+  // 那是 100 倍的面数，而且 99% 的时间一个像素都看不到。
+  //
+  // ── 几何策略 ──
+  // 座椅的 7 个零件先合并成 1 个几何，再用 InstancedMesh 铺 10 个座位，
+  // 整个座椅阵列只有 1 个 draw call。
+  // =========================================================================
+
+  /** 一排的座位中心（相对眼睛）。眼睛在 z = EYE_TO_WALL。 */
+  const SEAT_Z = [EYE_TO_WALL, EYE_TO_WALL + 0.55];
+  /**
+   * 座椅排位置（沿机身 x）。
+   *
+   * ── 为什么是 0.48 + k·0.8（偏移半个座位）──
+   * 相机（眼睛）位于 seatOffsetForRow 给出的 -1.52 / -0.72 / +0.08 /
+   * +0.88 / +1.68 之一。如果座椅正好放在这些位置上，相机就**坐在座椅内部**：
+   * 靠背离眼睛只有 0.21 m，占掉半个屏幕，还挡住了其他所有座位。
+   * 错开 0.4 m 之后，眼睛永远落在两个座位之间，转头看到的是
+   * 左右两侧座椅的靠背侧面 —— 这才是「转头能看见座位」该有的样子。
+   */
+  const SEAT_X = [-1.12, -0.32, 0.48, 1.28, 2.08];
+  /** 建模盒子的边界（超出这个范围的视线一定会被隔板挡住） */
+  const CABIN_X = 1.95;
+  const AISLE_Z = 1.45;
+  const FLOOR_Y = -0.82;
+  const CEIL_Y = 0.98;
+
+  // --- 材质 ---
+  const seatMat = new THREE.MeshStandardMaterial({
+    color: 0x33405a,   // 深蓝灰织物
+    roughness: 0.96,
+    metalness: 0.0,
+  });
+  const seatFrameMat = new THREE.MeshStandardMaterial({
+    color: 0x23262b,   // 深灰塑料骨架
+    roughness: 0.55,
+    metalness: 0.25,
+  });
+  const floorMat = new THREE.MeshStandardMaterial({
+    color: 0x14161a,   // 深灰地毯
+    roughness: 1.0,
+    metalness: 0.0,
+  });
+  const binMat = new THREE.MeshStandardMaterial({
+    color: 0x373c45,   // 行李架：浅一点的灰
+    roughness: 0.72,
+    metalness: 0.05,
+  });
+  disposables.push(seatMat, seatFrameMat, floorMat, binMat);
+
+  // --- 单个座椅的合并几何 ---
+  // 坐标：面朝 +x（机头），靠背在 -x，宽沿 z。
+  const seatParts: THREE.BufferGeometry[] = [];
+  {
+    // 坐垫
+    const cushion = new RoundedBoxGeometry(0.46, 0.11, 0.44, 2, 0.035);
+    cushion.translate(0, -0.56, 0);
+    seatParts.push(cushion);
+
+    // 靠背（向后倾 8°）
+    const back = new RoundedBoxGeometry(0.10, 0.64, 0.44, 2, 0.035);
+    back.rotateZ(-0.14);
+    back.translate(-0.21, -0.24, 0);
+    seatParts.push(back);
+
+    // 头枕
+    const head = new RoundedBoxGeometry(0.12, 0.19, 0.30, 2, 0.045);
+    head.rotateZ(-0.14);
+    head.translate(-0.255, 0.14, 0);
+    seatParts.push(head);
+
+    // 扶手 + 支柱
+    for (const side of [-1, 1]) {
+      const arm = new RoundedBoxGeometry(0.40, 0.055, 0.07, 2, 0.022);
+      arm.translate(0.01, -0.405, side * 0.245);
+      seatParts.push(arm);
+      const post = new RoundedBoxGeometry(0.05, 0.16, 0.05, 1, 0.015);
+      post.translate(0.13, -0.47, side * 0.245);
+      seatParts.push(post);
+    }
+  }
+  const seatGeo = mergeGeometries(seatParts, false);
+  seatParts.forEach((g) => g.dispose());
+  if (!seatGeo) throw new Error('seat geometry merge failed');
+  disposables.push(seatGeo);
+
+  const seatCount = SEAT_X.length * SEAT_Z.length;
+  const seats = new THREE.InstancedMesh(seatGeo, seatMat, seatCount);
+  seats.name = 'seats';
+  {
+    const m = new THREE.Matrix4();
+    let i = 0;
+    for (const x of SEAT_X) {
+      for (const z of SEAT_Z) {
+        // 每排稍微错开 1cm，避免完全一样的复制感
+        m.makeTranslation(x + (i % 3) * 0.01, 0, z);
+        seats.setMatrixAt(i++, m);
+      }
+    }
+    seats.instanceMatrix.needsUpdate = true;
+  }
+  root.add(seats);
+
+  // --- 地板 ---
+  {
+    const g = new THREE.PlaneGeometry(CABIN_X * 2 + 0.4, AISLE_Z + 0.12);
+    g.rotateX(-Math.PI / 2);
+    g.translate(0, FLOOR_Y, (AISLE_Z - 0.12) / 2);
+    disposables.push(g);
+    root.add(new THREE.Mesh(g, floorMat));
+  }
+
+  // --- 天花板 ---
+  {
+    const g = new THREE.PlaneGeometry(CABIN_X * 2 + 0.4, AISLE_Z + 0.12);
+    g.rotateX(Math.PI / 2);
+    g.translate(0, CEIL_Y, (AISLE_Z - 0.12) / 2);
+    disposables.push(g);
+    root.add(new THREE.Mesh(g, wallMat));
+  }
+
+  // --- 行李架（头顶靠窗一侧的长条盒子）---
+  {
+    const parts: THREE.BufferGeometry[] = [];
+    const bin = new RoundedBoxGeometry(0.60, 0.42, CABIN_X * 2 + 0.2, 2, 0.06);
+    // 局部：x 是机舱纵向？注意这里直接用世界朝向构造（见下）
+    bin.rotateY(Math.PI / 2); // 让长边沿 x
+    bin.translate(0, CEIL_Y - 0.24, 0.42);
+    parts.push(bin);
+    // 行李架下沿的挡板（让下缘有一条亮边）
+    const lip = new RoundedBoxGeometry(0.66, 0.05, CABIN_X * 2 + 0.2, 1, 0.02);
+    lip.rotateY(Math.PI / 2);
+    lip.translate(0, CEIL_Y - 0.46, 0.42);
+    parts.push(lip);
+    const g = mergeGeometries(parts, false);
+    parts.forEach((p) => p.dispose());
+    if (!g) throw new Error('bin geometry merge failed');
+    disposables.push(g);
+    root.add(new THREE.Mesh(g, binMat));
+  }
+
+  // --- 窗台（窗洞下沿的水平台面，真实飞机都有）---
+  {
+    const g = new RoundedBoxGeometry(0.14, 0.035, CABIN_X * 2 + 0.2, 1, 0.012);
+    g.rotateY(Math.PI / 2);
+    g.translate(0, -0.205, 0.07);
+    disposables.push(g);
+    root.add(new THREE.Mesh(g, wallMat));
+  }
+
+  // --- 前后隔板：把「无尽走廊」封死 ---
+  for (const sx of [-1, 1]) {
+    const g = new RoundedBoxGeometry(0.06, CEIL_Y - FLOOR_Y, AISLE_Z + 0.16, 1, 0.02);
+    g.translate(sx * (CABIN_X + 0.03), (CEIL_Y + FLOOR_Y) / 2, (AISLE_Z - 0.16) / 2);
+    disposables.push(g);
+    root.add(new THREE.Mesh(g, binMat));
+  }
+
+  // --- 过道侧矮隔断：挡住 z 方向漏出去的空白 ---
+  {
+    const g = new RoundedBoxGeometry(0.06, CEIL_Y - FLOOR_Y, CABIN_X * 2 + 0.2, 1, 0.02);
+    g.rotateY(Math.PI / 2);
+    g.translate(0, (CEIL_Y + FLOOR_Y) / 2, AISLE_Z + 0.03);
+    disposables.push(g);
+    root.add(new THREE.Mesh(g, binMat));
+  }
+
+
+  // =========================================================================
   // 3. 光照
   //
   // 关键：窗外极亮（太阳直射 + 大气散射），舱内极暗。
@@ -916,6 +1103,21 @@ export function createCabin(maxAnisotropy = 4): CabinObjects {
   windowLight.position.set(0, 0, -0.35);
   root.add(windowLight);
 
+  /**
+   * 舱内顶灯（新增）。
+   *
+   * 座椅是这次新加的几何，但原来的光照方案里没有任何光源从**舱内**
+   * 照亮它们 —— keyLight 从窗外打进来，只能照到座椅朝窗的那一面，
+   * 转头看到的靠背/头枕全都埋在黑里，等于白建。
+   *
+   * 真实机舱有行李架下沿的阅读灯带。这里用一个暖色点光源放在
+   * 行李架下方（y=0.72, z=0.62）模拟它，衰减距离 2.5 m，
+   * 只照亮座椅和过道，不会漏到窗外。
+   */
+  const cabinLight = new THREE.PointLight(0xdfe8f6, 2.2, 3.2, 1.2);
+  cabinLight.position.set(0, 0.72, 0.62);
+  root.add(cabinLight);
+
   return {
     root,
     wall,
@@ -924,6 +1126,7 @@ export function createCabin(maxAnisotropy = 4): CabinObjects {
     fillLight,
     rimLight,
     windowLight,
+    cabinLight,
     dispose() {
       wallGeo.dispose();
       wallMat.dispose();

@@ -45,8 +45,12 @@ export function createPane(params: Params, qualityIndex: number, cb: PaneCallbac
   fPov.addBinding(params, 'px', { label: 'px', min: -60, max: 60, step: 0.5 }).on('change', (ev) => cb.onChange({ px: ev.value }));
   fPov.addBinding(params, 'py', { label: 'py', min: -30, max: 30, step: 0.5 }).on('change', (ev) => cb.onChange({ py: ev.value }));
   fPov.addBinding(params, 'pd', { label: 'pd', min: -10, max: 60, step: 0.5 }).on('change', (ev) => cb.onChange({ pd: ev.value }));
-  fPov.addBinding(params, 'yaw', { label: 'yaw', min: -70, max: 70, step: 0.5 }).on('change', (ev) => cb.onChange({ yaw: ev.value }));
-  fPov.addBinding(params, 'pitch', { label: 'pitch', min: -45, max: 45, step: 0.5 }).on('change', (ev) => cb.onChange({ pitch: ev.value }));
+  // ── yaw / pitch 范围 ──
+  // 舱内只建了「转头 ±40° 以内」的那一小块（座椅、地板、行李架、隔板）。
+  // 再往外没有建模，所以必须在交互层就挡住 —— 这是最省性能的做法：
+  // 用范围换面数，而不是建完整个机舱再靠裁剪。
+  fPov.addBinding(params, 'yaw', { label: 'yaw', min: -55, max: 55, step: 0.5 }).on('change', (ev) => cb.onChange({ yaw: ev.value }));
+  fPov.addBinding(params, 'pitch', { label: 'pitch', min: -32, max: 32, step: 0.5 }).on('change', (ev) => cb.onChange({ pitch: ev.value }));
 
   // ---------------- 天气 ----------------
   const fWeather = pane.addFolder({ title: 'weather', expanded: false });
