@@ -98,6 +98,8 @@ export type CabinObjects = {
   skyLight: THREE.HemisphereLight;
   /** 机翼材质（main.ts 按昼夜调 envMapIntensity） */
   wingMaterial: THREE.MeshStandardMaterial;
+  /** 短舱材质（同上） */
+  nacelleMaterial: THREE.MeshStandardMaterial;
   dispose(): void;
 };
 
@@ -370,14 +372,20 @@ export function createCabin(maxAnisotropy = 4): CabinObjects {
   const TAPER_RATIO = 0.3;
   /** 后掠角（弧度）。真实 737 约 25° */
   const SWEEP = (25 * Math.PI) / 180;
-  /** 上反角（弧度）。真实客机约 5~6° */
-  const DIHEDRAL = (5.5 * Math.PI) / 180;
-  /** 翼尖扭转（弧度）。洗出角，让翼尖安装角变小 */
-  const WASHOUT = (-3 * Math.PI) / 180;
-  /** 翼根最大厚度比 */
-  const THICK_ROOT = 0.14;
+  /**
+   * 上反角（弧度）。
+   *
+   * 真实 737 约 5~6°，但在舷窗这种极度掠射的视角下，
+   * 5.5° 在 3 m 翼展上只有 0.29 m 的高差，透视压缩后几乎看不出上翘 ——
+   * 机翼就成了一块平板。这里用到 8°，靠近真实宽体机的观感上限。
+   */
+  const DIHEDRAL = (8.0 * Math.PI) / 180;
+  /** 翼尖扭转（弧度）。洗出角，让翼尖安装角变小 —— 也让翼面明暗有变化 */
+  const WASHOUT = (-4.5 * Math.PI) / 180;
+  /** 翼根最大厚度比（真实宽体机 0.12~0.15，取上限让弧度看得见） */
+  const THICK_ROOT = 0.155;
   /** 翼尖最大厚度比 */
-  const THICK_TIP = 0.09;
+  const THICK_TIP = 0.105;
 
   /**
    * 生成放样机翼几何。
@@ -445,8 +453,13 @@ export function createCabin(maxAnisotropy = 4): CabinObjects {
       for (let c = 0; c <= chordStations; c++) {
         const u = (1 - Math.cos((c / chordStations) * Math.PI)) * 0.5; // 0..1 从前缘到后缘
         const yt = nacaThickness(u, thick);
-        // 简单弯度线
-        const camber = 0.02;
+        /**
+         * ── 弯度线（camber）──
+         * 原来 0.02（2% 弦长）几乎看不出来：上表面基本是平的，
+         * 掠射视角下就是一块板。真实民航翼型是 3~5% 的弯度。
+         * 这里用 0.042，配合 15.5% 的根厚，上表面才有明显的「鼓」。
+         */
+        const camber = 0.042;
         const yc = camber * 4 * u * (1 - u);
 
         // 上表面
@@ -467,7 +480,7 @@ export function createCabin(maxAnisotropy = 4): CabinObjects {
       for (let c = chordStations - 1; c > 0; c--) {
         const u = (1 - Math.cos((c / chordStations) * Math.PI)) * 0.5;
         const yt = nacaThickness(u, thick);
-        const camber = 0.02;
+        const camber = 0.042;
         const yc = camber * 4 * u * (1 - u);
 
         const lowerY = (yc - yt) * chord;
@@ -607,7 +620,13 @@ export function createCabin(maxAnisotropy = 4): CabinObjects {
   disposables.push(skyEnv);
 
   const wingMat = new THREE.MeshStandardMaterial({
-    color: 0x9aa0a8,
+    /*
+     * ── 底色为什么调暗 ──
+     * 0x9aa0a8 加上环境反射 + 半球光 + 直射光之后，翼面几乎是纯白，
+     * 和原站的深灰差了一大截。真实机翼涂装是中性灰（0.35~0.45 反射率），
+     * 被强光照亮后才是浅灰，而不是一开始就白。
+     */
+    color: 0x5f666e,
     /*
      * roughness / metalness 都设 1.0，交给贴图完全决定：
      *   roughnessMap 的 G 通道：平面 0.32 / 缝底 0.88
@@ -823,9 +842,20 @@ export function createCabin(maxAnisotropy = 4): CabinObjects {
 
   const nacelleMat = new THREE.MeshStandardMaterial({
     // 短舱和机翼同一套涂装，但金属件更多，roughness 略低一点
-    color: 0x9298a0,
-    roughness: 0.62,
-    metalness: 0.06,
+    color: 0x6d737b,
+    roughness: 0.52,
+    metalness: 0.08,
+    /*
+     * ── 短舱为什么之前是纯黑 ──
+     * 它挂在机翼下方，朝相机的那一面法线基本水平，和 keyLight
+     * （从窗上方斜射下来）夹角接近 90° → 漫反射几乎为 0；
+     * 而 AmbientLight 只有 0.0x，又没有 envMap，暗部就彻底死了。
+     *
+     * 圆柱面是最能体现环境反射的形体 —— 加上天空环境图之后，
+     * 上半部会映到天光，下半部映到地面，自然出现一条明暗分界。
+     */
+    envMap: skyEnv,
+    envMapIntensity: 1.0,
     side: THREE.DoubleSide,
   });
   disposables.push(nacelleMat);
@@ -1066,6 +1096,7 @@ export function createCabin(maxAnisotropy = 4): CabinObjects {
     windowLight,
     skyLight,
     wingMaterial: wingMat,
+    nacelleMaterial: nacelleMat,
     dispose() {
       wallGeo.dispose();
       wallMat.dispose();

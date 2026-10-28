@@ -147,14 +147,25 @@ function drawPanelLayout(
    * 270×110 屏幕像素，弦向压缩后 3px/1024×110 ≈ 0.3 屏幕像素 ——
    * 亚像素级，mipmap 直接抹平。所以必须夸大到 9~15 px。
    */
+  /*
+   * ── 面板线必须「几乎看不见」──
+   *
+   * 之前 alpha 给到 0.42~0.68、线宽 9~15px，结果在画面里是一张
+   * 又粗又黑的网格 —— 像有人用马克笔在机翼上画了格子。
+   *
+   * 真实蒙皮缝隙只有 2~5 mm，在舷窗视角下是**亚像素级的极淡暗线**：
+   * 你能感觉到「这里有分块」，但不该看到一条线。
+   *
+   * 现在压到 0.07~0.16、线宽减半。目标是「眯眼看不出，凑近才发现」。
+   */
   const chordwiseLines: Array<[number, number, number, boolean]> = [
-    [0.055, 15, 0.68, true], // 缝翼后缘缝（最明显）
-    [0.085, 10, 0.48, true], // 缝翼滑轨盖板边界
-    [0.30, 9, 0.44, false],  // 前梁检修口
-    [0.48, 9, 0.42, false],  // 中央翼盒
-    [0.64, 13, 0.60, true],  // 襟翼/扰流板铰链线
-    [0.86, 9, 0.44, false],  // 后缘检修口
-    [0.94, 11, 0.52, true],  // 襟翼后缘
+    [0.055, 7, 0.16, true], // 缝翼后缘缝
+    [0.085, 5, 0.09, false], // 缝翼滑轨盖板边界
+    [0.30, 4, 0.07, false],  // 前梁检修口
+    [0.48, 4, 0.07, false],  // 中央翼盒
+    [0.64, 6, 0.13, true],   // 襟翼/扰流板铰链线
+    [0.86, 4, 0.07, false],  // 后缘检修口
+    [0.94, 5, 0.10, false],  // 襟翼后缘
   ];
   for (const [u, w, a, hl] of chordwiseLines) {
     if (isColor) {
@@ -165,13 +176,14 @@ function drawPanelLayout(
   }
 
   // ── 展向面板线（纹理上是横线）──
-  const spanwiseCount = 9;
+  // 展向线：真实机翼每 1.5~2 m 一道结构缝，比弦向更淡
+  const spanwiseCount = 7;
   for (let i = 1; i < spanwiseCount; i++) {
     const v = i / spanwiseCount;
     if (isColor) {
-      softLine(ctx, 0, v * height, width, v * height, 9, 0.48, i % 3 === 0);
+      softLine(ctx, 0, v * height, width, v * height, 5, 0.08, false);
     } else {
-      heightLine(ctx, 0, v * height, width, v * height, 9);
+      heightLine(ctx, 0, v * height, width, v * height, 5);
     }
   }
 
@@ -188,15 +200,15 @@ function drawPanelLayout(
     const y0 = v0 * height;
     const y1 = v1 * height;
     if (isColor) {
-      softLine(ctx, x0, y0, x1, y0, 10, 0.55, true);
-      softLine(ctx, x1, y0, x1, y1, 10, 0.55, true);
-      softLine(ctx, x1, y1, x0, y1, 10, 0.55, true);
-      softLine(ctx, x0, y1, x0, y0, 10, 0.55, true);
+      softLine(ctx, x0, y0, x1, y0, 5, 0.10, false);
+      softLine(ctx, x1, y0, x1, y1, 5, 0.10, false);
+      softLine(ctx, x1, y1, x0, y1, 5, 0.10, false);
+      softLine(ctx, x0, y1, x0, y0, 5, 0.10, false);
     } else {
-      heightLine(ctx, x0, y0, x1, y0, 10);
-      heightLine(ctx, x1, y0, x1, y1, 10);
-      heightLine(ctx, x1, y1, x0, y1, 10);
-      heightLine(ctx, x0, y1, x0, y0, 10);
+      heightLine(ctx, x0, y0, x1, y0, 5);
+      heightLine(ctx, x1, y0, x1, y1, 5);
+      heightLine(ctx, x1, y1, x0, y1, 5);
+      heightLine(ctx, x0, y1, x0, y0, 5);
     }
   }
 
@@ -204,16 +216,16 @@ function drawPanelLayout(
   const trackV = [0.22, 0.5, 0.78];
   for (const v of trackV) {
     if (isColor) {
-      softLine(ctx, 0.64 * width, v * height, 0.9 * width, v * height, 11, 0.5, true);
+      softLine(ctx, 0.64 * width, v * height, 0.9 * width, v * height, 5, 0.09, false);
     } else {
-      heightLine(ctx, 0.64 * width, v * height, 0.9 * width, v * height, 11);
+      heightLine(ctx, 0.64 * width, v * height, 0.9 * width, v * height, 5);
     }
   }
 
   // ── 前缘防冰带：表面有一层明显的凹槽（只做颜色）──
   if (isColor) {
     const leadingGrad = ctx.createLinearGradient(0, 0, 0.055 * width, 0);
-    leadingGrad.addColorStop(0, 'rgba(0, 0, 0, 0.45)');
+    leadingGrad.addColorStop(0, 'rgba(0, 0, 0, 0.16)');
     leadingGrad.addColorStop(1, 'rgba(0, 0, 0, 0)');
     ctx.fillStyle = leadingGrad;
     ctx.fillRect(0, 0, 0.055 * width, height);

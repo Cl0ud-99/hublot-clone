@@ -94,7 +94,7 @@ function main(root: HTMLElement) {
   // 把硬件支持的最大各向异性过滤传给机舱：
   // 机翼面板纹理在掠射角下完全依赖它才能保持清晰
   const cabin = createCabin(renderer.capabilities.getMaxAnisotropy());
-  const { keyLight, fillLight, rimLight, windowLight, skyLight, wingMaterial } = cabin;
+  const { keyLight, fillLight, rimLight, windowLight, skyLight, wingMaterial, nacelleMaterial } = cabin;
 
   const rig = new CameraRig();
 
@@ -390,7 +390,15 @@ function main(root: HTMLElement) {
     // 内壁会直接爆成白色。除以曝光倍数后，舱内在屏幕上保持稳定亮度
     // —— 这其实也符合人眼：暗环境下瞳孔放大，舱内灯看起来差不多亮。
     const cabinScale = 1 / Math.pow(exposureScale, 1.15);
-    keyLight.intensity = (0.55 + 3.0 * dayness) * cabinScale;
+    /**
+     * 主光（窗外太阳）。
+     *
+     * 白天从 0.55+3.0=3.55 降到 2.1：机翼的 albedo 0.37 乘上
+     * 主光 3.55 + 环境 1.0 + 半球 0.82 ≈ 1.85 的线性能量，
+     * ACES 之后接近纯白，机翼的弧度和面板线全被压平。
+     * 2.1 让它回到浅灰，弧度才有地方显出来。
+     */
+    keyLight.intensity = (0.55 + 1.55 * dayness) * cabinScale;
     keyLight.color.setRGB(1.0, 0.90 + 0.06 * dayness, 0.78 + 0.20 * dayness);
     fillLight.intensity = (0.55 + 0.45 * dayness + 0.25 * params.cabin) * cabinScale;
     // 补光偏冷蓝：模拟窗外夜空/暮光的反射
@@ -419,6 +427,7 @@ function main(root: HTMLElement) {
      *  2) 乘 dayness —— 夜里天空不发光，机翼当然不该映出蓝天
      */
     wingMaterial.envMapIntensity = (0.18 + 0.82 * dayness) * cabinScale;
+    nacelleMaterial.envMapIntensity = wingMaterial.envMapIntensity;
     // 白天偏暖（阳光），夜间偏冷（月光/城市灯光）
     windowLight.color.setRGB(
       0.62 + 0.38 * dayness,
