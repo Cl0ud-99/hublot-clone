@@ -15,7 +15,7 @@ import { PerformanceAdaptor } from './core/perf';
 import { CabinAudio } from './core/audio';
 import { createCabin, seatOffsetForRow } from './core/cabin';
 import { PostPipeline } from './core/post';
-import { computeSun, sunIrradiance, formatHour } from './core/sun';
+import { computeSun, sunIrradiance, sunDirectionInWindowFrame, autoExposureEV, formatHour } from './core/sun';
 import { createPane } from './core/pane';
 
 const app = document.getElementById('app');
@@ -84,7 +84,8 @@ function main(root: HTMLElement) {
   // -------------------------------------------------------------------------
 
   const scene = new THREE.Scene();
-  const sky = new SkyRenderer();
+  // 天空渲染器需要在构造时生成多重散射 LUT（几个 32×32 的 GPU pass）
+  const sky = new SkyRenderer(renderer);
   // 天空先渲染，且不写深度（材质里设了 depthWrite:false），
   // 机舱随后正常绘制并遮挡它，窗洞自然透出天空。
   sky.mesh.renderOrder = -1000;
@@ -109,7 +110,7 @@ function main(root: HTMLElement) {
   // 排查「几何在哪、有没有被裁掉、包围盒多大」这类问题非常有用。
   // 生产构建时 import.meta.env.DEV 为 false，会被 tree-shake 掉。
   if (import.meta.env.DEV) {
-    (window as unknown as Record<string, unknown>).__hublot = { renderer, scene, cabin, rig };
+    (window as unknown as Record<string, unknown>).__hublot = { renderer, scene, cabin, rig, sky };
   }
 
   // HDR + bloom 后期管线
@@ -277,12 +278,22 @@ function main(root: HTMLElement) {
   let currentHour = params.hour;
 
   const worldSun = new THREE.Vector3();
+  /** 太阳方向在舷窗坐标系里的分量（未归一化） */
+  const sunLocal = new THREE.Vector3();
   const sunColor: [number, number, number] = [1, 1, 1];
   /** 飞行位移累积量（km），驱动地表/云/灯光图案流过画面 */
   const flightOffset = new THREE.Vector2(0, 0);
 
-  const east = rig.getSiteEast();
-  const north = rig.getSiteNorth();
+  /**
+   * 舷窗参考系：太阳方向以它为基准映射到世界。
+   *
+   * 原站的做法（逆向自 bundle）：
+   *   sunDir = (cos(az-π)cos(el), sin(el), sin(az-π)cos(el))
+   * 直接写在着色器的相机坐标系里，-Z 就是 yaw=0 的视线方向。
+   * 所以太阳永远在舷窗正前方附近巡游，默认 yaw=-18° 把它推到画面右侧。
+   */
+  const refForward = rig.getReferenceForward();
+  const refRight = rig.getReferenceRight();
   const up = rig.getSiteUp();
 
   function frame() {
@@ -301,20 +312,28 @@ function main(root: HTMLElement) {
     }
 
     // --- 太阳方向 ---
-    // 10 月下旬法国为冬令时（UTC+1）
-    const sun = computeSun(currentHour, C.SITE_LAT, C.SITE_LON, 1);
-    // computeSun 返回的是地平坐标（x 东 / y 上 / z 南），转到世界坐标
+    // 原站用固定的第 298 天（10 月 25 日）+ 时区/经度/均时差修正，
+    // 得到 (el, az)；azimuth 是相对舷窗坐标系的（az-180° 映射到 -Z）。
+    const sun = computeSun(currentHour);
+    const [sx, sy, sz] = sunDirectionInWindowFrame(sun);
+    sunLocal.set(sx, sy, sz);
     worldSun
-      .set(0, 0, 0)
-      .addScaledVector(east, sun.direction[0])
-      .addScaledVector(up, sun.direction[1])
-      .addScaledVector(north, -sun.direction[2])
+      .copy(up)
+      .multiplyScalar(sunLocal.y)
+      .addScaledVector(refForward, -sunLocal.z)
+      .addScaledVector(refRight, sunLocal.x)
       .normalize();
 
-    const irr = sunIrradiance(sun.altitudeDeg);
+    const irr = sunIrradiance(sun.elevationDeg);
     sunColor[0] = irr[0];
     sunColor[1] = irr[1];
     sunColor[2] = irr[2];
+
+    // --- 相机自动曝光 ---
+    // 从正午到暮光，天空辐亮度跨 5 个数量级，固定曝光不可能两头都好看。
+    // autoExposureEV 按太阳高度给出 EV，params.ev 是用户的手动偏移。
+    const autoEV = autoExposureEV(sun.elevationDeg);
+    const exposureScale = Math.pow(2, autoEV + params.ev);
 
     // --- 相机 ---
     rig.update(elapsed, dt, params);
@@ -344,7 +363,7 @@ function main(root: HTMLElement) {
       rig.worldPos,
       worldSun,
       sunColor,
-      Math.pow(2, params.ev),
+      exposureScale,
       elapsed,
     );
 
@@ -358,7 +377,7 @@ function main(root: HTMLElement) {
 
     // --- 同步机舱光照与时间 ---
     // 窗外的亮度决定了舱内的明暗：日出前舱内很暗，白天被照亮。
-    const sunAltSin = Math.sin((sun.altitudeDeg * Math.PI) / 180);
+    const sunAltSin = Math.sin((sun.elevationDeg * Math.PI) / 180);
     const dayness = Math.max(0, Math.min(1, (sunAltSin + 0.1) / 0.35));
 
     // ── 舱内照明 ──
@@ -366,19 +385,21 @@ function main(root: HTMLElement) {
     // 真实机舱里，窗外的天光和城市灯光会照亮内壁，
     // 让墙呈现出很暗但可辨的层次（这也是「不像 CG」的细节之一）。
     //
-    // 之前黎明前 keyLight 只有 0.15、fillLight 只有 0.58，
-    // 在 ACES 压缩后基本归零 → 大面积死黑，超宽屏上尤其明显。
-    // 现在把地板值抬高，并让补光带一点窗外的冷色调。
-    keyLight.intensity = 0.55 + 3.0 * dayness;
+    // 注意末尾除以 exposureScale：
+    // 自动曝光把暮光整体提亮了几百倍，如果舱内灯不跟着降，
+    // 内壁会直接爆成白色。除以曝光倍数后，舱内在屏幕上保持稳定亮度
+    // —— 这其实也符合人眼：暗环境下瞳孔放大，舱内灯看起来差不多亮。
+    const cabinScale = 1 / Math.pow(exposureScale, 1.15);
+    keyLight.intensity = (0.55 + 3.0 * dayness) * cabinScale;
     keyLight.color.setRGB(1.0, 0.90 + 0.06 * dayness, 0.78 + 0.20 * dayness);
-    fillLight.intensity = 0.55 + 0.45 * dayness + 0.25 * params.cabin;
+    fillLight.intensity = (0.55 + 0.45 * dayness + 0.25 * params.cabin) * cabinScale;
     // 补光偏冷蓝：模拟窗外夜空/暮光的反射
     fillLight.color.setRGB(0.42, 0.52, 0.78);
-    rimLight.intensity = 0.12 + 0.3 * dayness;
+    rimLight.intensity = (0.12 + 0.3 * dayness) * cabinScale;
 
     // 窗口光：让内壁从窗边到远处有明暗梯度（而不是一块均匀的深灰）。
     // 强度跟着窗外亮度走 —— 白天窗外很亮，内壁被照亮得更多。
-    windowLight.intensity = 0.5 + 1.6 * dayness;
+    windowLight.intensity = (0.5 + 1.6 * dayness) * cabinScale;
     // 白天偏暖（阳光），夜间偏冷（月光/城市灯光）
     windowLight.color.setRGB(
       0.62 + 0.38 * dayness,
@@ -386,29 +407,33 @@ function main(root: HTMLElement) {
       0.95 - 0.15 * dayness,
     );
 
+    // 城市灯光也按曝光反向缩放：否则暮光曝光一提，地面会变成一片熔金。
+    // 指数取 1.35（而不是 1）：城市灯是点光源，动态范围远大于天空，
+    // 线性反比缩放在高曝光下仍会让「都市圈宏观辉光」铺满整个地面。
+    sky.setCities(params.cities / Math.pow(exposureScale, 1.55));
+    // 星星同样要抵消自动曝光（指数略小于 1，保留一点「越暗星越多」的感觉）
+    sky.setStarScale(1 / Math.pow(exposureScale, 0.95));
+
     // --- 渲染 ---
     // 相机放在原点：世界位置由 shader 的 uCamPos 决定，
     // 这里只需要朝向矩阵正确。
     rig.camera.position.set(0, 0, 0);
     rig.camera.updateMatrixWorld();
 
-    // ── bloom 阈值要随昼夜变化 ──
-    // 这是本项目最容易忽略的一处：
-    // 白天场景的线性辐亮度可以到 5~20（太阳直射地面），
-    // 而黎明前整个场景只有 0.02~0.3（全靠城市灯光和暮光）。
-    // 如果阈值固定 0.85，夜景里没有任何像素能越过它 ——
-    // bloom 完全失效，但控制台不会有任何报错，非常难查。
+    // ── bloom 阈值 ──
+    // 注意 bloom-bright.frag 里是**先乘 uExposure 再比阈值**，
+    // 所以这里的数值是「显示亮度」单位，不需要再除以 exposureScale。
+    // 早期版本不知道这一点，把阈值也按曝光反比缩了 —— 结果暮光时
+    // 整片天幕（显示亮度 0.1 左右）全部越过阈值，被 bloom 糊成一团白光。
     //
-    // 所以用 dayness 在「夜晚低阈值」和「白天高阈值」之间插值，
-    // 让两个时段都能正常出光晕。
-    const nightThreshold = 0.06;
-    const dayThreshold = 1.2;
-    const autoThreshold = nightThreshold + (dayThreshold - nightThreshold) * dayness;
+    // 0.55 略高于天空的目标显示亮度（0.15），只让太阳圆盘、城市灯光
+    // 这类真正的高光起辉；白天再把阈值抬一点，避免整片天空泛光。
+    const autoThreshold = 0.55 + 0.5 * dayness;
 
     // 走 HDR 后期管线：场景 → 亮部提取 → 金字塔模糊 → 合成（ACES + 颗粒 + 暗角）
     // 曝光在这里统一应用，所以 sky shader 只输出纯线性辐亮度。
     post.render(scene, rig.camera, {
-      exposure: Math.pow(2, params.ev),
+      exposure: exposureScale,
       time: elapsed,
       bloom: {
         strength: params.bloomStrength,

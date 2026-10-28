@@ -32,3 +32,6 @@ node_modules/.vite/
 
 # 调试产物
 .playwright-mcp/
+
+# 原站 bundle（逆向用，不提交）
+.ref/

@@ -55,11 +55,19 @@ float hash12(vec2 p) {
 }
 
 void main() {
-  vec3 scene = texture2D(tScene, vUv).rgb;
+  vec3 scene = texture2D(tScene, vUv).rgb * uExposure;
   vec3 bloom = texture2D(tBloom, vUv).rgb;
 
-  // --- 叠加 bloom ---
-  // 用加法而不是 mix：光晕是「额外进入镜头的光」，物理上是相加的。
+  /**
+   * ── bloom 已经在上游乘过曝光了 ──
+   *
+   * bloom-bright.frag 里是 `c = texture * uExposure`，因为阈值要按
+   * 「显示亮度」比较（否则暮光下阈值得跟着曝光反比缩放，极难维护）。
+   *
+   * 所以这里 **不能再乘一次 uExposure** —— 那会变成 exposure²。
+   * 曝光 = 1 时看不出来（1²=1），一上自动曝光（512×）就是 26 万倍，
+   * 整个窗口被 bloom 糊成一片死白。这是一个只在 HDR 曝光变化后才暴露的经典 bug。
+   */
   vec3 color = scene + bloom * uBloomStrength;
 
   // --- 调试：直接可视化 bloom 缓冲 ---
@@ -73,9 +81,11 @@ void main() {
   }
 
   // --- 曝光 ---
-  // 放在 bloom 之后、色调映射之前。
-  // 这样调整曝光时 bloom 的相对强度保持不变，符合相机的行为。
-  color *= uExposure;
+  // 注意：曝光已经在上面乘到 scene 上了（bloom 在它自己的 Pass 里乘过），
+  // 这里不要再乘一次。
+  //
+  // 放在 bloom 之后、色调映射之前，这样调整曝光时 bloom 的相对强度保持不变，
+  // 符合相机的行为。
 
   // --- 色调映射 ---
   color = acesToneMap(color);

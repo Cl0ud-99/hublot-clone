@@ -62,6 +62,16 @@ export class CameraRig {
   private siteNorth = new THREE.Vector3();
   private siteUp = new THREE.Vector3();
 
+  /**
+   * 舷窗参考坐标系（yaw = 0 / pitch = 0）。
+   *
+   * forward = 视线方向（水平），right = 屏幕右方，up = 天顶。
+   * 太阳方向用它映射到世界：这样「太阳相对画面在哪」只由 yaw/azimuth 决定，
+   * 不受地理位置影响 —— 原站就是这么做的。
+   */
+  private refForward = new THREE.Vector3();
+  private refRight = new THREE.Vector3();
+
   /** 阻尼后的局部偏移（米） */
   private localOffset = new THREE.Vector3();
   /** 阻尼后的基准角度（弧度） */
@@ -109,8 +119,19 @@ export class CameraRig {
     this.siteNorth
       .set(-Math.sin(lat) * Math.cos(lon), Math.cos(lat), -Math.sin(lat) * Math.sin(lon))
       .normalize();
-    // east = north × up
-    this.siteEast.crossVectors(this.siteNorth, this.siteUp).normalize();
+    // east = up × north
+    //
+    // ── 这里曾经写反了 ──
+    // 原来是 north × up，得到的是**西**不是东（在赤道本初子午线上算一下：
+    // north=(0,1,0), up=(1,0,0)，north×up=(0,0,-1)，而东应该是 +z）。
+    // 后果是整个地理坐标系变成左手的：太阳方位东西颠倒、px 平移方向也反了。
+    // 因为机舱和相机都建在同一套错坐标里，画面自洽，所以一直没暴露；
+    // 一旦把太阳和真实方位对齐就会立刻出错。
+    this.siteEast.crossVectors(this.siteUp, this.siteNorth).normalize();
+
+    // 舷窗参考系：yaw = 0 时看向正北（水平），屏幕右方 = forward × up
+    this.refForward.copy(this.siteNorth);
+    this.refRight.crossVectors(this.refForward, this.siteUp).normalize();
 
     // --- 地平线下俯角 ---
     const R = C.EARTH_RADIUS_KM;
@@ -126,6 +147,14 @@ export class CameraRig {
   }
   getSiteEast(): THREE.Vector3 {
     return this.siteEast;
+  }
+
+  /** 舷窗参考系（yaw=0/pitch=0）：forward 水平朝前，right 屏幕右方，up 天顶 */
+  getReferenceForward(): THREE.Vector3 {
+    return this.refForward;
+  }
+  getReferenceRight(): THREE.Vector3 {
+    return this.refRight;
   }
 
   /**

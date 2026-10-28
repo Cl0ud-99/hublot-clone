@@ -55,6 +55,9 @@ uniform vec2 uFlightOffset;
 // --- 城市灯光 ---
 uniform float uCities;
 
+/** 星星亮度缩放（自动曝光越高，这个值越小，保证星星在屏幕上亮度恒定） */
+uniform float uStarScale;
+
 // --- 天气 ---
 uniform float uLowClouds;
 uniform float uCirrus;
@@ -65,7 +68,8 @@ uniform int uSteps;
 // --- 调试通道 ---
 // 0 = 正常渲染
 // 1 = 人口密度场   2 = 像素足迹(km)   3 = 城市灯光原值
-// 4 = 大气透射率   5 = 地面反照率     6 = 天空散射分量
+// 4 = 大气透射率   5 = 地面反照率     6 = 天空散射（仅单次）
+// 7 = 天空散射（仅多次）
 uniform int uDebugMode;
 
 varying vec2 vUv;
@@ -350,7 +354,10 @@ vec3 cityLights(vec3 groundPoint, vec3 normal, float tGround, float detail) {
   // 用 smoothstep 而不是 pop²，否则「有人的地方」会整片发亮。
   // 真实高空夜景是「黑色大地 + 稀疏亮点」，只有真正的大城市才有光晕。
   float cityMask = smoothstep(0.18, 0.62, pop);
-  col += vec3(1.0, 0.68, 0.38) * cityMask * 0.40;
+  // 宏观辉光权重原来给到 0.40，在自动曝光的暮光档位下会在地面铺成一片
+  // 连贯的橙色地毯（因为法国人口密度底图几乎处处非零）。
+  // 真实高空夜景是「黑地面 + 稀疏亮点」，所以压到 0.18。
+  col += vec3(1.0, 0.68, 0.38) * cityMask * 0.30;
 
   // --- 微观层：三个尺度的灯点叠加 ---
   // 尺度单位 km：都市圈 6、城区 1.5、街区 0.4
@@ -466,41 +473,12 @@ void main() {
   bool aboveHorizon = dot(dir, upDir) > horizonSin;
 
   // =========================================================================
-  // 1. 大气（天空散射）
-  // =========================================================================
-  vec3 color = skyRadiance(camPos, dir, uSunDir, uSunColor, 0.0, uSteps);
-
-  // --- 暮光补光 ---
-  // 单次散射有一个已知缺陷：太阳落到地平线以下后，天空会迅速变全黑，
-  // 但真实世界里高层大气仍被照亮，形成「蓝色时刻」。
-  // 原因是那些光要经过「太阳 → 高层大气散射 → 相机」两段以上的路径，
-  // 而单次散射只积分了「相机 → 单次散射点」这一段。
+  // 1. 大气（单次 + 多次散射）
   //
-  // 这里补一个解析项：以「太阳高度」为强度、以「视线相对太阳方向的
-  // 角距离」为分布的经验暮光模型。这不是物理精确解，但视觉上足以
-  // 覆盖单次散射的盲区，且成本几乎为零（原站用多重散射 LUT 解决同一问题）。
-  {
-    float sunAltSin = dot(uSunDir, upDir);
-    // 太阳在地平线下方 8° 以内都有暮光
-    float twilight = smoothstep(-0.16, 0.02, sunAltSin);
-    if (twilight > 0.001) {
-      // 暮光集中在太阳方位一侧的地平线附近
-      vec3 sunHoriz = normalize(uSunDir - upDir * sunAltSin + vec3(1e-6, 0.0, 0.0));
-      float towardSun = max(dot(normalize(dir - upDir * dot(dir, upDir) + vec3(1e-6, 0.0, 0.0)), sunHoriz), 0.0);
-      // 地平线附近的仰角权重
-      float horizonBand = exp(-max(dot(dir, upDir), -0.15) * 5.5);
-      // 向着太阳的方向更亮更暖
-      float warm = pow(towardSun, 1.6);
-      // 冷色（背光侧）+ 暖色（朝阳侧）
-      vec3 cool = vec3(0.10, 0.16, 0.32);
-      vec3 warmCol = vec3(0.85, 0.42, 0.18);
-      vec3 tint = mix(cool, warmCol, warm);
-      // 太阳越接近地平线，暖色越强（日出/日落的红霞）
-      float lowness = 1.0 - smoothstep(-0.16, 0.02, sunAltSin);
-      tint = mix(tint, warmCol, lowness * warm * 0.7);
-      color += tint * horizonBand * twilight * 0.42;
-    }
-  }
+  // `msMode = 1` 表示「单次 + 多次」。多次散射项直接从 LUT 取，
+  // 覆盖了太阳落到地平线以下后单次散射的盲区 —— 不再需要经验暮光补丁。
+  // =========================================================================
+  vec3 color = skyRadiance(camPos, dir, uSunDir, uSunColor, 0.0, uSteps, 1);
 
   // =========================================================================
   // 2. 地面
@@ -532,8 +510,15 @@ void main() {
     float shadow = (raySphereNearest(gp, uSunDir, uEarthRadius) > 0.0) ? 0.0 : 1.0;
     vec3 direct = uSunColor * sunTrans * (cosSun * shadow / PI);
 
-    // --- 天空环境光（粗略）---
-    vec3 ambient = uSunColor * 0.055 * (0.35 + 0.65 * (1.0 - cosSun));
+    // --- 天空环境光 ---
+    // 用多重散射 LUT 在**地面点**的值当作天空辐照度：
+    // F_total 是「来自四面八方的散射光按方向平均的辐亮度」，
+    // 对半球近似各向同性时，水平面辐照度 E ≈ π·F。
+    //
+    // 早期这里写的是 `uSunColor * 0.055 * (0.35 + 0.65*(1-cosSun))` ——
+    // 纯经验式，且完全不随时间变化，夜里会让地面亮得像阴天。
+    vec3 skyIrradiance = uSunColor * PI * msLookup(gp, uSunDir) * uMSStrength;
+    vec3 ambient = skyIrradiance;
 
     vec3 groundCol = albedo * (direct + ambient);
 
@@ -556,16 +541,29 @@ void main() {
     // --- 地面到相机的衰减（提前算，城市灯光也要用）---
     vec3 viewTrans = atmosphereTransmittance(opticalDepth(camPos, dir, tGround, 10));
 
-    // --- 城市灯光 ---
+    // 城市灯光
     // 乘 viewTrans 让远处灯光被大气吸收；nightWeight 让白天不亮灯
     vec3 lights = cityLights(gp, nrm, tGround, detail);
     float sunAltitudeSin = dot(uSunDir, upDir);
-    float nightWeight = 1.0 - smoothstep(-0.08, 0.10, sunAltitudeSin);
+    float nightWeight = 1.0 - smoothstep(-0.16, -0.02, sunAltitudeSin);
     groundCol += lights * viewTrans * nightWeight;
 
-    vec3 haze = uSunColor * 0.0009 * (1.0 - viewTrans);
-
-    color += groundCol * viewTrans + haze;
+    /**
+     * ── 这里曾经有一个假的「大气雾」项 ──
+     *
+     *   vec3 haze = uSunColor * 0.0009 * (1.0 - viewTrans);
+     *   color += groundCol * viewTrans + haze;
+     *
+     * 它的本意是补上「地面到相机之间的空气散射」。但现在 skyRadiance()
+     * 已经沿同一条视线把整段大气积完了（包括到地面交点之前的所有散射），
+     * 再加一遍就是重复计算。更要命的是它**不随昼夜变化**：
+     * 固定 0.0009 的系数在自动曝光 700 倍下会直接饱和成一片纯白，
+     * 把整块地面糊掉 —— 这也是为什么之前地面是死白的。
+     *
+     * 现在只保留地面本身的辐亮度 × 大气透射率，气溶胶的雾感由
+     * Mie 散射在 skyRadiance() 里物理地产生。
+     */
+    color += groundCol * viewTrans;
   }
 
   // =========================================================================
@@ -633,8 +631,19 @@ void main() {
       vec2 ciOffset = uFlightOffset * 0.72 + vec2(uTime * 0.012, uTime * 0.004);
       float ci = cirrusLayer(p2 * CIRRUS_KM_TO_UV + ciOffset * CIRRUS_KM_TO_UV, uCirrus);
       if (ci > 0.0) {
-        float sunFacing = max(dot(dir, uSunDir), 0.0);
-        vec3 ciColor = uSunColor * (0.05 + 0.03 * sunFacing);
+        /**
+         * ── 卷云亮度必须来自「它所在高度的实际光照」 ──
+         *
+         * 原来是 `uSunColor * (0.05 + 0.03*sunFacing)` —— 一个与太阳高度
+         * 完全无关的常数项。曝光 = 1 时看着还行，一旦自动曝光把暮光提亮
+         * 500 倍，这层常数就成了 0.3~0.5 的线性亮度，把整片上方天空
+         * 糊成一个巨大的白色光球（还带 bloom）。
+         *
+         * 现在改成查多重散射 LUT：取 14 km 高度上的环境辐亮度。
+         * 太阳落到地平线以下后，14 km 处的地球本影边界约在 -3.8°，
+         * 所以 -11° 时卷云应该是全黑的 —— 物理上就该如此。
+         */
+        vec3 ciColor = uSunColor * msLookup(ciP, uSunDir) * 0.9;
         color = mix(color, color + ciColor, clamp(ci * 0.35 * ciFade, 0.0, 0.5));
       }
     }
@@ -645,9 +654,14 @@ void main() {
   // =========================================================================
   {
     float sunAlt = dot(uSunDir, upDir);           // 太阳高度的正弦
-    float night = 1.0 - smoothstep(-0.10, 0.06, sunAlt);
+    // 星星必须在天空还亮的时候彻底消失。以 -6°/-11° 为界：
+    // 太阳 -2° 时天光已经压下大部分恒星，只有最亮的几颗还在。
+    float night = 1.0 - smoothstep(-0.19, -0.10, sunAlt);
     if (night > 0.001 && aboveHorizon) {
-      color += starField(dir, pixelAngle, uTime) * night * 55.0;
+      // uStarScale 抵消自动曝光：星星是点光源，屏幕上应该始终是同样亮的小点。
+      // 不乘的话，暮光档位 512× 曝光会把每颗星放大到 80 的线性亮度，
+      // 再经 bloom 变成一片白斑 —— 看起来像镜头脏了。
+      color += starField(dir, pixelAngle, uTime) * night * 55.0 * uStarScale;
     }
   }
 
@@ -658,6 +672,17 @@ void main() {
     float cosTheta = clamp(dot(dir, uSunDir), -1.0, 1.0);
     float angle = acos(cosTheta);
 
+    /**
+     * ── 太阳必须在几何地平线以上才画 ──
+     * 早期版本靠 sunIrradiance() 在太阳高度 -8° 以下把 uSunColor 归零
+     * 来「顺手」隐藏圆盘和光晕。现在 uSunColor 是恒定的大气层外辐照度，
+     * 就必须显式做地平线裁剪，否则夜里会有一个挂在地平线下的太阳光斑
+     * 叠在地面上（因为地面是加法合成的，挡不住它）。
+     */
+    float sunAltSin = dot(uSunDir, upDir);
+    float sunUp = smoothstep(horizonSin, horizonSin + 0.012, sunAltSin);
+    float skyMask = aboveHorizon ? 1.0 : 0.0;
+
     // 圆盘：用像素角做抗锯齿，边缘刚好一个像素
     float disc = 1.0 - smoothstep(uSunAngularRadius - pixelAngle, uSunAngularRadius + pixelAngle, angle);
 
@@ -665,17 +690,24 @@ void main() {
       opticalDepth(camPos, dir, raySphereFar(camPos, dir, uAtmosphereRadius), 8)
     );
 
-    color += uSunColor * disc * sunTransView * 180.0;
+    color += uSunColor * disc * sunTransView * 180.0 * sunUp * skyMask;
 
-    // 光晕：单次散射不足以产生日晕，补两个解析项
-    // 指数别开太大，pow 在移动端对 3000 次方精度不稳
-    float c = max(cosTheta, 0.0);
-    float c2 = c * c;
-    float c4 = c2 * c2;
-    float c8 = c4 * c4;
-    float tight = c8 * c8 * c8 * c8 * c8;      // ≈ cos^40
-    float halo = tight * 2.5 + c8 * c8 * 0.08; // ≈ cos^40 与 cos^16
-    color += uSunColor * halo * sunTransView * 0.55;
+    /**
+     * ── 这里曾经有一个手写的「日晕」项 ──
+     *
+     *   float halo = pow(c,40)*2.5 + pow(c,16)*0.08;
+     *   color += uSunColor * halo * sunTransView * 0.55;
+     *
+     * 当年加它是因为单次散射的 Mie 相位函数太窄，太阳周围不够亮。
+     * 但它有两个致命问题：
+     *   1) cos^16 的尾巴极长 —— 离太阳 19° 还有 0.40，
+     *      乘上 uSunColor×0.55 就是 2.7 的线性辐亮度，直接把半个窗口糊成白色。
+     *   2) 和物理 Mie 散射重复计算：skyRadiance() 里的 Cornette-Shanks
+     *      相位函数已经给出了正确的日晕形状和能量。
+     *
+     * 自动曝光一上，这个「常数级」的假光晕立刻暴露成一大片死白 ——
+     * 这是典型的「经验项在低动态范围下看不出来、一进 HDR 就炸」。
+     */
   }
 
   // =========================================================================
@@ -732,9 +764,15 @@ void main() {
       gl_FragColor = vec4(c, 1.0);
       return;
     } else if (uDebugMode == 6) {
-      // 纯天空散射（不含地面/云/太阳盘）
-      vec3 c = skyRadiance(camPos, dir, uSunDir, uSunColor, 0.0, uSteps);
+      // 纯天空散射（**只要单次**）—— 用来对比多次散射的贡献
+      vec3 c = skyRadiance(camPos, dir, uSunDir, uSunColor, 0.0, uSteps, 0);
       // 用固定曝光看结构
+      c = pow(clamp(c * 4.0, 0.0, 1.0), vec3(1.0 / 2.2));
+      gl_FragColor = vec4(c, 1.0);
+      return;
+    } else if (uDebugMode == 7) {
+      // **只要多次散射** —— 直接看暮光是谁提供的
+      vec3 c = skyRadiance(camPos, dir, uSunDir, uSunColor, 0.0, uSteps, 2);
       c = pow(clamp(c * 4.0, 0.0, 1.0), vec3(1.0 / 2.2));
       gl_FragColor = vec4(c, 1.0);
       return;

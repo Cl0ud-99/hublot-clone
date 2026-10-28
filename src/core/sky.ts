@@ -1,6 +1,7 @@
 import * as THREE from 'three';
 import skyVert from '../shaders/fullscreen.vert';
 import skyFrag from '../shaders/sky.frag';
+import { AtmosphereLUT } from './atmosphereLUT';
 import { generateNoiseTextureData } from './noise';
 import {
   generatePopulationMap,
@@ -28,8 +29,9 @@ export class SkyRenderer {
   private readonly noiseTex: THREE.DataTexture;
   private readonly popTex: THREE.DataTexture;
   private readonly u: Record<string, THREE.IUniform>;
+  private readonly lut: AtmosphereLUT;
 
-  constructor() {
+  constructor(renderer: THREE.WebGLRenderer) {
     // --- 噪声纹理 ---
     const NOISE_SIZE = 512;
     const noiseData = generateNoiseTextureData(NOISE_SIZE, 1337);
@@ -71,6 +73,10 @@ export class SkyRenderer {
     this.popTex.needsUpdate = true;
 
     // --- uniforms ---
+    // 多重散射 LUT：32×32 的 (海拔, 太阳天顶角) → 方向平均散射辐亮度。
+    // 生成需要几个 GPU pass，所以放在构造函数里一次算完。
+    this.lut = new AtmosphereLUT(renderer);
+
     this.u = {
       uResolution: { value: new THREE.Vector2(1, 1) },
       uTime: { value: 0 },
@@ -91,8 +97,16 @@ export class SkyRenderer {
       uOzoneWidth: { value: C.OZONE_WIDTH_KM },
       uRayleighBeta: { value: new THREE.Vector3(...C.RAYLEIGH_BETA) },
       uMieBeta: { value: C.MIE_BETA },
+      uMieAbsorb: { value: C.MIE_ABSORB },
       uOzoneBeta: { value: new THREE.Vector3(...C.OZONE_BETA) },
       uMieG: { value: C.MIE_G },
+
+      // 多重散射
+      uMultiScatterLUT: { value: this.lut.texture },
+      uMSStrength: { value: 1 },
+      // 星星亮度缩放：自动曝光提亮几百倍时，星星必须同比压回去，
+      // 否则每颗星都会变成一团带 bloom 的白色光斑
+      uStarScale: { value: 1 },
 
       // 城市灯光
       uCities: { value: 1 },
@@ -190,6 +204,16 @@ export class SkyRenderer {
     this.u.uCities.value = Math.max(0, intensity);
   }
 
+  /** 多次散射强度（1 = 物理值，0 = 关闭）。用于 A/B 对比。 */
+  setMSStrength(v: number) {
+    this.u.uMSStrength.value = Math.max(0, v);
+  }
+
+  /** 星星亮度缩放（随自动曝光反向缩放） */
+  setStarScale(v: number) {
+    this.u.uStarScale.value = Math.max(0, v);
+  }
+
   /**
    * 飞行位移（km）。驱动地表/云/灯光图案流过画面。
    *
@@ -215,5 +239,6 @@ export class SkyRenderer {
     this.mesh.geometry.dispose();
     this.noiseTex.dispose();
     this.popTex.dispose();
+    this.lut.dispose();
   }
 }

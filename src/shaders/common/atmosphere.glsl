@@ -1,18 +1,18 @@
 /**
- * 大气散射公共函数（单次散射版）
+ * 大气散射公共函数
  *
- * 设计取舍：
- *   原站用预计算 LUT（Transmittance / Multi-scattering / Irradiance），
- *   代价是 3 个 compute pass + 复杂的纹理索引。
- *   在「固定巡航高度 + 固定舷窗机位」下，单次散射 + 数值 ray-march
- *   的误差通常在 5% 以内 —— 因为高空大气密度只剩地面的 ~30%，多次散射贡献极小。
+ * 物理模型：
+ *   - Rayleigh 散射（分子，λ^-4，蓝色天空的来源）
+ *   - Mie 散射 + 吸收（气溶胶，太阳周围的白色光晕、地平线雾霾）
+ *   - 臭氧吸收（Chappuis 带，让「蓝色时刻」呈现深蓝而不是灰蓝）
+ *   - 单次散射：沿视线 ray-march，逐点算光学厚度与太阳透射率
+ *   - 多次散射：从预计算的 LUT 取各向同性散射场（见 multiscatter.glsl）
  *
- * 这里提供：
- *   - 大气密度模型（Rayleigh + Mie 指数衰减，臭氧高斯层）
- *   - 光学厚度积分与透射率
- *   - 单次散射的天空辐亮度
- *   - 射线与球体求交
- *   - Rayleigh / Mie 相位函数
+ * 关键点：`uSunColor` 必须是**大气层外的太阳辐照度**，是一个常数。
+ * 早先版本在 sunIrradiance() 里按太阳高度做了一次「经验红化 + 衰减」，
+ * 而着色器里又按路径做了一次物理透射 —— 同一份消光被算了两次，
+ * 结果日落时颜色过暗过红，且太阳一落到 -8° 就被强行熄灯，
+ * 暮光完全靠一个手工加的 tint 撑着。现在把消光全部交还给物理。
  *
  * 单位：长度一律 km。方向一律单位向量。
  */
@@ -21,6 +21,7 @@
 #define ATMOSPHERE_GLSL
 
 #include "./atmo-uniforms.glsl"
+#include "./multiscatter.glsl"
 
 // ---------------------------------------------------------------------------
 // 球体求交
@@ -76,9 +77,19 @@ vec3 opticalDepth(vec3 origin, vec3 dir, float tEnd, int steps) {
   return od;
 }
 
-/** 光学厚度 → 透射率 */
+/**
+ * 光学厚度 → 透射率。
+ *
+ * ── 必须包含 Mie 吸收 ──
+ * 消光 = 散射 + 吸收。早期版本只用了 uMieBeta（散射）算消光，
+ * 相当于假设气溶胶不吸收 —— 这让地平线附近的雾霾偏薄、日落偏亮偏黄。
+ * 真实气溶胶的单次散射反照率约 0.9，漏掉吸收会高估约 20% 的透过率。
+ */
 vec3 atmosphereTransmittance(vec3 od) {
-  return exp(-(uRayleighBeta * od.x + uMieBeta * od.y + uOzoneBeta * od.z));
+  vec3 extinction = uRayleighBeta * od.x
+                  + vec3((uMieBeta + uMieAbsorb) * od.y)
+                  + uOzoneBeta * od.z;
+  return exp(-extinction);
 }
 
 // ---------------------------------------------------------------------------
@@ -96,20 +107,42 @@ float phaseMie(float cosTheta, float g) {
   return (1.0 - gg) / (4.0 * PI * denom);
 }
 
+/**
+ * Cornette-Shanks 相位函数（气溶胶）。
+ *
+ *   P(θ) = 3(1-g²)/(8π(2+g²)) · (1+cos²θ) / (1+g²-2g·cosθ)^1.5
+ *
+ * ── 为什么不用 Henyey-Greenstein ──
+ * HG 在 θ=0 处峰值偏低、在大角度处尾巴偏长，太阳周围的晕会「糊」。
+ * 原站 bundle 里用的就是这一支（`3/(8π)·(1-g²)/(2+g²)`，g 默认 0.8），
+ * 逆推出常量后在能量和形状上都比 HG 更贴近真实气溶胶。
+ */
+float phaseMieCS(float cosTheta, float g) {
+  float g2 = g * g;
+  float k = (3.0 / (8.0 * PI)) * ((1.0 - g2) / (2.0 + g2));
+  float denom = pow(max(1.0 + g2 - 2.0 * g * cosTheta, 1e-4), 1.5);
+  return k * (1.0 + cosTheta * cosTheta) / denom;
+}
+
+/** 兼容旧调用：现在统一走 Cornette-Shanks。 */
+float phaseMieDual(float cosTheta, float g) {
+  return phaseMieCS(cosTheta, g);
+}
+
 // ---------------------------------------------------------------------------
-// 单次散射积分
+// 单次 + 多次散射积分
 // ---------------------------------------------------------------------------
 
 /**
- * 天空辐亮度（单次散射）。不含地面 —— 地面由调用方单独处理，
- * 因为地面需要程序化细节，而这里只算大气。
+ * 天空辐亮度。
  *
  * @param rayOrigin 相机位置（球心原点，km）
  * @param rayDir    视线单位向量
- * @param sunDir    太阳单位向量
- * @param sunColor  太阳线性辐照度
+ * @param sunDir    太阳单位方向
+ * @param sunColor  大气层外的太阳辐照度（线性 RGB）
  * @param earthAlbedo 想要地面反照贡献时传 >0（本 shader 传 0）
  * @param steps     ray-march 步数
+ * @param msMode    0 = 只要单次散射；1 = 单次 + 多次；2 = 只要多次散射
  */
 vec3 skyRadiance(
   vec3 rayOrigin,
@@ -117,7 +150,8 @@ vec3 skyRadiance(
   vec3 sunDir,
   vec3 sunColor,
   float earthAlbedo,
-  int steps
+  int steps,
+  int msMode
 ) {
   float tGround = raySphereNearest(rayOrigin, rayDir, uEarthRadius);
   float tAtmo = raySphereFar(rayOrigin, rayDir, uAtmosphereRadius);
@@ -129,7 +163,7 @@ vec3 skyRadiance(
 
   float cosTheta = dot(rayDir, sunDir);
   float phaseR = phaseRayleigh(cosTheta);
-  float phaseM = phaseMie(cosTheta, uMieG);
+  float phaseM = phaseMieDual(cosTheta, uMieG);
 
   vec3 sum = vec3(0.0);
   float odR = 0.0;
@@ -158,6 +192,21 @@ vec3 skyRadiance(
 
     vec3 viewTrans = atmosphereTransmittance(vec3(odR, odM, odO));
 
+    // --- 多次散射项 ---
+    // 注意：这里**不乘** sunTrans。LUT 里存的是「已经经历了完整路径」的
+    // 散射场，太阳透射率、地球本影、上下各阶散射全都在里面了。
+    vec3 msInscatter = vec3(0.0);
+    if (msMode > 0 && uMSStrength > 0.0) {
+      vec3 msField = msLookup(p, sunDir);
+      msInscatter = (uRayleighBeta * dens.x + vec3(uMieBeta * dens.y)) * msField * uMSStrength;
+    }
+
+    if (msMode == 2) {
+      sum += msInscatter * viewTrans * ds;
+      continue;
+    }
+
+    // --- 单次散射项 ---
     // 采样点 → 太阳
     float tSun = raySphereFar(p, sunDir, uAtmosphereRadius);
     vec3 sunOD = opticalDepth(p, sunDir, tSun, 6);
@@ -169,7 +218,7 @@ vec3 skyRadiance(
     }
 
     vec3 inscatter = (uRayleighBeta * dens.x * phaseR + vec3(uMieBeta * dens.y * phaseM)) * ds;
-    sum += inscatter * viewTrans * sunTrans;
+    sum += (inscatter * sunTrans + msInscatter) * viewTrans;
   }
 
   vec3 color = sum * sunColor;
@@ -189,6 +238,11 @@ vec3 skyRadiance(
   }
 
   return max(color, vec3(0.0));
+}
+
+/** 兼容旧调用：默认只要单次散射。 */
+vec3 skyRadiance(vec3 rayOrigin, vec3 rayDir, vec3 sunDir, vec3 sunColor, float earthAlbedo, int steps) {
+  return skyRadiance(rayOrigin, rayDir, sunDir, sunColor, earthAlbedo, steps, 0);
 }
 
 #endif

@@ -60,11 +60,20 @@ export const RAYLEIGH_BETA = [0.00867, 0.013558, 0.0265] as const;
 export const MIE_BETA = 0.003996;
 /** Mie 吸收系数（每千米）。REV: 0.00444 */
 export const MIE_ABSORB = 0.00444;
-/** Mie 相位函数的各向异性参数 g（前向散射）。 */
-export const MIE_G = 0.76;
+/** Mie 相位函数的各向异性参数 g（前向散射）。REV: 原站 Cornette-Shanks 默认 0.8 */
+export const MIE_G = 0.8;
 
-/** 臭氧吸收系数（每千米，RGB）。REV */
-export const OZONE_BETA = [0.00277, 0.001881, 0.0026] as const;
+/**
+ * 臭氧吸收系数（每千米，RGB）。REV
+ *
+ * ── 这里曾经多写了一个零 ──
+ * 原站 bundle 里是 `V5(.00277,.001881,26e-5)`，即 [0.00277, 0.001881, 0.00026]。
+ * 我们之前把最后一项写成了 0.0026 —— 蓝通道吸收被放大 10 倍。
+ * 后果：任何长光程（地平线附近、暮光）蓝光被吃光，
+ * 天空从蓝渐变变成**黄绿色**，而且暮光越深越明显。
+ * 这个常数对暮光观感的影响远大于它的数值大小，属于「差一个量级就全错」的类型。
+ */
+export const OZONE_BETA = [0.00277, 0.001881, 0.00026] as const;
 /** 臭氧层中心高度（km）与半宽（km）。 */
 export const OZONE_CENTER_KM = 25.0;
 export const OZONE_WIDTH_KM = 15.0;
